@@ -5,6 +5,7 @@ import streamlit as st
 from frontend.accounts import account_page, authentication, logout
 from frontend.admin import admin_page
 from frontend.ai_page import ai_page
+from frontend.analytics import analytics_page
 from frontend.client import APIError, resource
 from frontend.common import ROLE_LABELS, api, clear_session, go, is_admin, show_error, user
 from frontend.problems import problems_page
@@ -21,6 +22,7 @@ from frontend.submissions import submissions_page
 NAV_ITEMS = {
     "题库": ("problems", ":material/menu_book:"),
     "提交记录": ("submissions", ":material/terminal:"),
+    "成绩总览": ("analytics", ":material/monitoring:"),
     "智能命题": ("authoring", ":material/auto_awesome:"),
     "账户": ("account", ":material/person:"),
     "管理工作区": ("admin", ":material/manage_accounts:"),
@@ -51,6 +53,7 @@ def _sidebar(selected, profile):
                 st.html('<p class="oj-nav-group">学习工作台</p>')
                 _navigation_button("题库", selected)
                 _navigation_button("提交记录", selected)
+                _navigation_button("成绩总览", selected)
                 st.html('<p class="oj-nav-group">创作工具</p>')
                 _navigation_button("智能命题", selected)
                 if is_admin():
@@ -118,6 +121,7 @@ def main():
     pages = {
         "题库": problems_page,
         "提交记录": submissions_page,
+        "成绩总览": analytics_page,
         "智能命题": ai_page,
         "账户": account_page,
     }

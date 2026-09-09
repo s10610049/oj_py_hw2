@@ -18,6 +18,25 @@ from typing import Any
 PROBLEM_STATUS_SCHEMA = "oj.problem-status.v1"
 LEARNING_STATS_SCHEMA = "oj.learning-stats.v1"
 OUTCOME_IDS = ("pending", "judge_error", "zero_score", "partial", "full")
+VERDICT_IDS = {
+    "pending",
+    "accepted",
+    "wrong_answer",
+    "partial",
+    "compile_error",
+    "time_limit",
+    "memory_limit",
+    "runtime_error",
+    "judge_error",
+}
+_JUDGE_VERDICTS = {
+    "CE": "compile_error",
+    "TLE": "time_limit",
+    "MLE": "memory_limit",
+    "RE": "runtime_error",
+    "WA": "wrong_answer",
+    "UNK": "judge_error",
+}
 
 PROBLEM_VERSION_FIELDS = (
     "id",
@@ -243,6 +262,7 @@ def _prepare_submissions(
                 "created_time": created_time,
                 "date": created_time.date().isoformat(),
                 "outcome": _outcome(status, score, counts),
+                "verdict": _submission_verdict(raw, status, score, counts),
             }
         )
     prepared.sort(key=_latest_order)
@@ -306,6 +326,11 @@ def _problem_projection(
         "best": _submission_ref(best),
         "latest_terminal": _submission_ref(latest_terminal),
         "historical_best": _submission_ref(historical_best),
+        "latest_outcome": (
+            latest_pending["verdict"]
+            if latest_pending is not None
+            else latest_terminal["verdict"] if latest_terminal is not None else None
+        ),
         "version_unknown": any(item["relation"] == "unknown" for item in submissions),
     }
     attempted = bool(current_terminal or pending)
@@ -525,6 +550,7 @@ def _context_epoch(
             "created_at": item["created_at"],
             "problem_version": item["problem_version"],
             "version_inferred": item["version_inferred"],
+            "verdict": item["verdict"],
         }
         for item in submissions
     ]
@@ -646,6 +672,33 @@ def _outcome(status: str, score: int | float | None, counts: int | float | None)
     if score is not None and score > 0:
         return "partial"
     return "zero_score"
+
+
+def _submission_verdict(
+    raw: Mapping[str, Any],
+    status: str,
+    score: int | float | None,
+    counts: int | float | None,
+) -> str:
+    """Reduce private judge details to one allow-listed, display-safe enum."""
+
+    if status == "pending":
+        return "pending"
+    if status != "success":
+        return "judge_error"
+    if counts is not None and counts > 0 and score == counts:
+        return "accepted"
+    if score is not None and score > 0:
+        return "partial"
+    details = raw.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, Mapping):
+                continue
+            verdict = _JUDGE_VERDICTS.get(detail.get("result"))
+            if verdict is not None:
+                return verdict
+    return "judge_error"
 
 
 def _valid_best(submission: Mapping[str, Any]) -> bool:

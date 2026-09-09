@@ -12,6 +12,7 @@ CSS = """
   --oj-bg:#F5F5F7;--oj-surface:#FFFFFF;--oj-text:#1D1D1F;--oj-muted:#6E6E73;
   --oj-border:#E8E8ED;--oj-border-accent:#BDD7C8;--oj-border-accent-strong:#7FA68F;
   --oj-surface-tint:#F7FBF8;--oj-focus-ring:rgba(26,107,74,.13);
+  --oj-success:#187A55;--oj-danger:#C13D3D;--oj-warning:#A76500;--oj-info:#3468A5;
   --oj-ease:cubic-bezier(.2,0,0,1);}
 /* Streamlit 1.63's supported minimal toolbar mode is the primary control.
    These exact framework selectors prevent a transient Deploy/menu flash while
@@ -33,6 +34,107 @@ header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainM
 .oj-table tbody tr {transition:background-color 180ms var(--oj-ease);}
 .oj-table tbody tr:hover {background:#F3F8F5;}
 .oj-table-scroll:focus-visible {outline:2px solid var(--oj-primary);outline-offset:2px;}
+/* Personal progress: compact OJ semantics with text labels as well as color. */
+.st-key-workspace_shell [class*="st-key-catalog_problem_"] {
+  padding:14px 16px;margin:10px 0;border:1px solid var(--oj-border-accent);
+  border-radius:14px;background:var(--oj-surface);box-shadow:0 1px 0 rgba(15,74,50,.025);
+  transition:border-color 180ms var(--oj-ease),box-shadow 180ms var(--oj-ease),
+    transform 180ms var(--oj-ease);}
+.st-key-workspace_shell [class*="st-key-catalog_problem_"]:hover {
+  border-color:var(--oj-border-accent-strong);box-shadow:0 8px 24px rgba(15,74,50,.055);
+  transform:translateY(-1px);}
+.oj-catalog-badges {display:flex;align-items:flex-end;justify-content:center;
+  flex-direction:column;gap:6px;min-width:0;}
+.oj-status-token,.oj-difficulty-token,.oj-state-token {display:inline-flex;align-items:center;
+  max-width:100%;
+  width:max-content;padding:3px 9px;border:1px solid var(--oj-token-border,#D7DDDA);
+  border-radius:999px;background:var(--oj-token-bg,#F1F3F2);color:var(--oj-token,#5E6561);
+  font-size:11px;font-weight:500;line-height:1.45;overflow-wrap:anywhere;}
+.status-ac {--oj-token:#126A49;--oj-token-bg:#E7F5EE;--oj-token-border:#B9DECB;}
+.status-failed,.status-runtime {--oj-token:#A93333;--oj-token-bg:#FCEEEE;
+  --oj-token-border:#EFC8C8;}
+.status-partial,.status-outdated,.status-timeout,.status-memory {
+  --oj-token:#935C00;--oj-token-bg:#FFF5E4;--oj-token-border:#EED5A9;}
+.status-compile,.status-judge-error {--oj-token:#2C5F9A;--oj-token-bg:#EDF4FC;
+  --oj-token-border:#C7D9EE;}
+.status-pending {--oj-token:#42647E;--oj-token-bg:#EFF4F7;--oj-token-border:#CFDCE4;}
+.status-unattempted,.status-unavailable {--oj-token:#686D6A;--oj-token-bg:#F3F4F4;
+  --oj-token-border:#DCDDDE;}
+.state-passed {--oj-token:#126A49;--oj-token-bg:#E7F5EE;--oj-token-border:#B9DECB;}
+.state-failed {--oj-token:#A93333;--oj-token-bg:#FCEEEE;--oj-token-border:#EFC8C8;}
+.state-partial,.state-outdated {--oj-token:#935C00;--oj-token-bg:#FFF5E4;
+  --oj-token-border:#EED5A9;}
+.state-pending {--oj-token:#42647E;--oj-token-bg:#EFF4F7;--oj-token-border:#CFDCE4;}
+.state-unattempted {--oj-token:#686D6A;--oj-token-bg:#F3F4F4;
+  --oj-token-border:#DCDDDE;}
+.difficulty-red {--oj-token:#B43B42;--oj-token-bg:#FCEEEF;--oj-token-border:#EEC8CB;}
+.difficulty-orange {--oj-token:#A55812;--oj-token-bg:#FFF2E7;--oj-token-border:#EACDB3;}
+.difficulty-yellow {--oj-token:#806313;--oj-token-bg:#FFF9DB;--oj-token-border:#E7D98E;}
+.difficulty-green {--oj-token:#14704F;--oj-token-bg:#E9F6EF;--oj-token-border:#BBDDCB;}
+.difficulty-cyan {--oj-token:#176B75;--oj-token-bg:#EAF7F8;--oj-token-border:#B9DEE1;}
+.difficulty-blue {--oj-token:#315E9E;--oj-token-bg:#EDF3FC;--oj-token-border:#C5D6EF;}
+.difficulty-purple {--oj-token:#7048A0;--oj-token-bg:#F5EFFB;--oj-token-border:#D9C9EA;}
+.difficulty-black {--oj-token:#343438;--oj-token-bg:#EEEEF0;--oj-token-border:#CACAD0;}
+.difficulty-neutral {--oj-token:#686D6A;--oj-token-bg:#F3F4F4;--oj-token-border:#DCDDDE;}
+/* Analytics markup is framework-independent and responsive without a chart library. */
+.oj-analytics-kpis {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;
+  margin:18px 0 28px;}
+.oj-analytics-kpi {min-width:0;min-height:96px;box-sizing:border-box;padding:15px 16px;
+  border:1px solid #DCE9E2;border-radius:14px;background:var(--oj-surface-tint);}
+.oj-analytics-kpi:first-child {border-color:var(--oj-border-accent-strong);
+  background:#F1F8F4;}
+.oj-analytics-kpi-label {display:block;color:var(--oj-muted);font-size:12px;line-height:1.5;
+  margin-bottom:9px;}
+.oj-analytics-kpi-value {color:var(--oj-text);font-size:clamp(20px,2.2vw,28px);
+  font-weight:500;line-height:1.15;font-variant-numeric:tabular-nums;letter-spacing:-.02em;}
+.oj-analytics-kpi-unit {color:var(--oj-muted);font-size:11px;margin-left:6px;}
+.oj-chart,.oj-panel,.oj-analytics-table-wrap {box-sizing:border-box;border:1px solid
+  var(--oj-border-accent);border-radius:16px;background:var(--oj-surface);}
+.oj-chart {padding:14px 16px;margin:10px 0 22px;overflow:hidden;}
+.oj-timeline svg {display:block;max-width:100%;font-family:'Noto Sans SC',system-ui,sans-serif;}
+.oj-timeline-axis {fill:var(--oj-muted);font-size:11px;font-variant-numeric:tabular-nums;}
+.oj-timeline-points circle {stroke:#FFFFFF;stroke-width:2;outline:none;}
+.oj-timeline-points circle:focus {stroke:var(--oj-primary-dark);stroke-width:3;}
+.oj-chart-empty {box-sizing:border-box;margin:10px 0;padding:24px;border:1px dashed
+  var(--oj-border-accent);border-radius:12px;color:var(--oj-muted);font-size:13px;
+  text-align:center;background:var(--oj-surface-tint);}
+.oj-analytics-grid {display:grid;gap:14px;margin:14px 0;}
+.oj-analytics-grid-two {grid-template-columns:repeat(2,minmax(0,1fr));}
+.oj-panel {min-width:0;padding:18px;}
+.oj-panel-knowledge {margin:14px 0 24px;}
+.oj-panel h3 {font-size:15px;font-weight:500;margin:0 0 16px;color:var(--oj-text);}
+.oj-bar-list {display:flex;flex-direction:column;gap:14px;}
+.oj-bar-row {min-width:0;}
+.oj-bar-meta {display:flex;align-items:center;justify-content:space-between;gap:12px;
+  min-width:0;margin-bottom:7px;color:var(--oj-muted);font-size:11px;}
+.oj-bar-meta > span:last-child {white-space:nowrap;font-variant-numeric:tabular-nums;}
+.oj-bar-track {height:6px;overflow:hidden;border-radius:999px;background:#ECEFED;}
+.oj-bar-fill {display:block;height:100%;border-radius:inherit;background:var(--oj-token,#1A6B4A);}
+.outcome-pending {--oj-token:#607D91;}
+.outcome-judge_error {--oj-token:#4271A8;}
+.outcome-zero_score {--oj-token:#C14B4B;}
+.outcome-partial {--oj-token:#BB780C;}
+.outcome-full {--oj-token:#187A55;}
+.knowledge-mastery {--oj-token:#238363;}
+.oj-analytics-table-wrap {overflow:auto;margin:10px 0 24px;}
+.oj-analytics-table {width:100%;min-width:720px;border-collapse:collapse;color:var(--oj-text);
+  font-size:13px;line-height:1.55;}
+.oj-analytics-table th,.oj-analytics-table td {padding:12px 14px;text-align:left;
+  border-bottom:1px solid var(--oj-border);vertical-align:middle;}
+.oj-analytics-table thead th {position:sticky;top:0;background:#F7F9F8;color:#555B58;
+  font-size:11px;font-weight:500;white-space:nowrap;}
+.oj-analytics-table tbody tr:last-child > * {border-bottom:0;}
+.oj-analytics-table tbody tr {transition:background-color 180ms var(--oj-ease);}
+.oj-analytics-table tbody tr:hover {background:#F4F8F6;}
+.oj-analytics-table tbody th {font-weight:400;min-width:180px;}
+.oj-problem-id {display:block;color:var(--oj-muted);font:500 10px 'JetBrains Mono',monospace;
+  margin-bottom:2px;}
+.oj-problem-title {display:block;overflow-wrap:anywhere;}
+.oj-problem-tags {max-width:260px;overflow-wrap:anywhere;color:#555B58;}
+.oj-number {font-variant-numeric:tabular-nums;white-space:nowrap;}
+.oj-sr-only {position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:nowrap;border:0;}
+.oj-analytics-table-wrap:focus-visible {outline:2px solid var(--oj-primary);outline-offset:2px;}
 /* Mark and changing text use separate native slots so 1s polling does not
    replace the animated mark's HTML or reannounce an unchanged live status. */
 .st-key-ai_loading_surface {padding:20px 24px;min-height:132px;box-sizing:border-box;
@@ -108,6 +210,7 @@ header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainM
 .st-key-workspace_shell [class*="st-key-route_content_"] {
   min-height:30rem;animation:oj-route-problems 220ms var(--oj-ease);}
 .st-key-workspace_shell .st-key-route_content_submissions {animation-name:oj-route-submissions;}
+.st-key-workspace_shell .st-key-route_content_analytics {animation-name:oj-route-analytics;}
 .st-key-workspace_shell .st-key-route_content_authoring {animation-name:oj-route-authoring;}
 .st-key-workspace_shell .st-key-route_content_account {animation-name:oj-route-account;}
 .st-key-workspace_shell .st-key-route_content_admin {animation-name:oj-route-admin;}
@@ -169,6 +272,8 @@ header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainM
   to {opacity:1;transform:translateY(0)}}
 @keyframes oj-route-submissions {from {opacity:.78;transform:translateY(6px)}
   to {opacity:1;transform:translateY(0)}}
+@keyframes oj-route-analytics {from {opacity:.78;transform:translateY(6px)}
+  to {opacity:1;transform:translateY(0)}}
 @keyframes oj-route-authoring {from {opacity:.78;transform:translateY(6px)}
   to {opacity:1;transform:translateY(0)}}
 @keyframes oj-route-account {from {opacity:.78;transform:translateY(6px)}
@@ -184,10 +289,13 @@ header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainM
   .st-key-workspace_shell [class*="st-key-route_content_"],.st-key-workspace_nav {
     animation:none;opacity:1;transform:none;}
   .st-key-auth_shell button,.st-key-workspace_nav button,.st-key-workspace_shell button,
-  .st-key-workspace_shell [data-testid="stForm"],.oj-table tbody tr {transition:none;}
+  .st-key-workspace_shell [data-testid="stForm"],.oj-table tbody tr,
+  .oj-analytics-table tbody tr,
+  .st-key-workspace_shell [class*="st-key-catalog_problem_"] {transition:none;}
   .st-key-auth_shell button:not(:disabled):active,
   .st-key-workspace_nav button:not(:disabled):active,
   .st-key-workspace_shell button:not(:disabled):active {transform:none;}
+  .st-key-workspace_shell [class*="st-key-catalog_problem_"]:hover {transform:none;}
 }
 @media (max-width:1100px) {
   /* Streamlit 1.63 puts each keyed block inside a flex-item layout wrapper.
@@ -199,16 +307,25 @@ header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainM
   .st-key-auth_composition {max-width:480px;min-height:640px;}
   .st-key-auth_shell {width:100%;}
 }
+@media (max-width:860px) {
+  .oj-analytics-grid-two {grid-template-columns:1fr;}
+  .oj-analytics-kpis {grid-template-columns:repeat(2,minmax(0,1fr));}
+}
 @media (max-width:640px) {
   .st-key-ai_loading_surface {padding:16px;gap:12px;}
   .st-key-workspace_shell {min-height:calc(100dvh - 6rem);}
   .oj-context-badge {font-size:10px;}
+  .oj-catalog-badges {align-items:flex-start;}
+  .oj-chart,.oj-panel {padding:14px;}
+  .oj-bar-meta {align-items:flex-start;}
 }
 @media (max-width:480px) {
   .st-key-auth_layout {margin:.5rem 0 1rem;}
   .st-key-auth_composition {border-radius:16px;}
   .st-key-auth_shell {padding:24px 20px;}
   .oj-workspace-header {gap:8px;}
+  .oj-analytics-kpis {grid-template-columns:1fr;gap:8px;}
+  .oj-analytics-kpi {min-height:82px;}
 }
 </style>
 """
@@ -249,7 +366,7 @@ def sidebar_brand():
 def active_navigation(slug):
     # Change only the selected style, never the button/container identity. This
     # keeps native keyboard focus attached while moving between route pages.
-    if slug not in {"problems", "submissions", "authoring", "account", "admin"}:
+    if slug not in {"problems", "submissions", "analytics", "authoring", "account", "admin"}:
         raise ValueError("Unknown navigation target")
     selector = f".st-key-workspace_nav .st-key-nav_item_{slug} button"
     st.html(

@@ -352,6 +352,69 @@ def test_outdated_pending_submission_does_not_overlay_the_current_problem():
     assert row["latest_pending"] is None
 
 
+@pytest.mark.parametrize(
+    ("judge_code", "expected"),
+    [
+        ("CE", "compile_error"),
+        ("TLE", "time_limit"),
+        ("MLE", "memory_limit"),
+        ("RE", "runtime_error"),
+        ("WA", "wrong_answer"),
+        ("UNK", "judge_error"),
+    ],
+)
+def test_latest_outcome_is_an_allow_listed_privacy_safe_verdict(judge_code, expected):
+    problem = make_problem("verdict", 1)
+    submission = make_submission(
+        "verdict-row",
+        problem["id"],
+        problem_version_digest(problem),
+        "success",
+        0,
+        10,
+        1,
+    )
+    submission["details"] = [
+        {
+            "id": 1,
+            "result": judge_code,
+            "time": 999,
+            "memory": 999,
+            "private": "must-not-leak",
+        }
+    ]
+
+    result = build_progress_snapshot([problem], [submission], USER, generated_at=STAMP)
+    row = result["statuses"]["items"][0]
+
+    assert row["latest_outcome"] == expected
+    assert set(row) == {
+        "problem_id",
+        "title",
+        "current_problem_version",
+        "state",
+        "latest_pending",
+        "best",
+        "latest_terminal",
+        "historical_best",
+        "latest_outcome",
+        "version_unknown",
+    }
+    assert "private" not in json.dumps(result)
+
+
+def test_passed_state_survives_pending_overlay_and_reports_pending_activity():
+    problem = make_problem("passed-pending", 1)
+    version = problem_version_digest(problem)
+    passed = make_submission("passed", problem["id"], version, "success", 10, 10, 1)
+    pending = make_submission("pending", problem["id"], version, "pending", None, None, 2)
+
+    row = build_problem_statuses([problem], [passed, pending], USER, generated_at=STAMP)["items"][0]
+
+    assert row["state"] == "passed"
+    assert row["latest_outcome"] == "pending"
+
+
 def test_zero_data_has_null_rates_and_never_nan():
     result = build_progress_snapshot([], [], USER, generated_at=STAMP)
     assert result["statuses"]["items"] == []
@@ -386,7 +449,14 @@ def test_epoch_is_shared_deterministic_and_secret_safe():
         assert secret not in rendered
 
     changed_runtime = [
-        {**submission, "code": "DIFFERENT_CODE", "details": ["DIFFERENT_DETAIL"]}
+        {
+            **submission,
+            "code": "DIFFERENT_CODE",
+            "details": [
+                {**detail, "private": "DIFFERENT_DETAIL"} if isinstance(detail, dict) else detail
+                for detail in submission["details"]
+            ],
+        }
         for submission in submissions
     ]
     changed = snapshot(problems, changed_runtime, generated_at="2099-01-01T00:00:00+00:00")

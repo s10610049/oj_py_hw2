@@ -11,6 +11,7 @@ from streamlit.testing.v1 import AppTest
 
 from frontend.client import APIClient, APIError
 from frontend.forms import optional_number, parse_cases, problem_payload
+from frontend.problems import difficulty_projection, problem_badges_html, problem_status_index
 
 ROOT = Path(__file__).resolve().parents[1]
 USER = {
@@ -47,6 +48,96 @@ CONFIG = {
     "output_price": None,
     "price_unit": 1_000_000,
     "currency": "CNY",
+}
+PROBLEM_STATUSES = {
+    "schema_version": "oj.problem-status.v1",
+    "context_epoch": "test-epoch",
+    "generated_at": "2026-09-09T12:00:00+00:00",
+    "items": [
+        {
+            "problem_id": "sum",
+            "title": "两数之和",
+            "current_problem_version": "version-1",
+            "state": "passed",
+            "latest_outcome": "accepted",
+            "latest_pending": None,
+            "best": None,
+            "latest_terminal": {"status": "success"},
+            "historical_best": None,
+            "version_unknown": False,
+            "code": "SECRET_STATUS_CODE",
+            "details": [{"input": "SECRET_STATUS_CASE"}],
+        }
+    ],
+}
+LEARNING_STATS = {
+    "schema_version": "oj.learning-stats.v1",
+    "context_epoch": "test-epoch",
+    "generated_at": "2026-09-09T12:00:00+00:00",
+    "scope": {
+        "user_id": "u1",
+        "catalog_problem_count": 1,
+        "submission_count": 2,
+        "orphan_submission_count": 0,
+        "version_unknown_count": 0,
+        "timezone": "UTC",
+    },
+    "kpis": {
+        "earned_score": 10,
+        "available_score": 10,
+        "attempted_count": 1,
+        "passed_count": 1,
+        "pass_rate": 1.0,
+    },
+    "submission_outcomes": [
+        {"id": "pending", "count": 0},
+        {"id": "judge_error", "count": 0},
+        {"id": "zero_score", "count": 1},
+        {"id": "partial", "count": 0},
+        {"id": "full", "count": 1},
+    ],
+    "timeline": [
+        {
+            "date": "2026-09-09",
+            "submissions": 2,
+            "completed": 2,
+            "best_score_delta": 10,
+            "cumulative_score": 10,
+        }
+    ],
+    "difficulty": [
+        {
+            "difficulty_id": "luogu.1",
+            "difficulty_label": "入门",
+            "attempted": 1,
+            "passed": 1,
+            "earned_score": 10,
+            "available_score": 10,
+            "rate": 1.0,
+        }
+    ],
+    "knowledge_points": [
+        {
+            "tag": "基础",
+            "attempted": 1,
+            "passed": 1,
+            "earned_score": 10,
+            "available_score": 10,
+            "rate": 1.0,
+        }
+    ],
+    "problems": [
+        {
+            "problem_id": "sum",
+            "title": "两数之和",
+            "state": "passed",
+            "available_score": 10,
+            "best_score": 10,
+            "difficulty_id": "luogu.1",
+            "difficulty_label": "入门",
+            "tags": ["基础"],
+        }
+    ],
 }
 
 
@@ -87,6 +178,8 @@ class FakeAPI:
             "created_at": "2026-09-09",
         }
         self.log = {"score": 0, "counts": 10}
+        self.problem_statuses = deepcopy(PROBLEM_STATUSES)
+        self.learning_stats = deepcopy(LEARNING_STATS)
 
     def close(self):
         self.closed = True
@@ -112,6 +205,10 @@ class FakeAPI:
                 self.problems.append(deepcopy(json))
                 return {"id": json["id"]}
             return deepcopy(self.problems)
+        if path == "/api/me/problem-statuses/":
+            return deepcopy(self.problem_statuses)
+        if path == "/api/me/learning-stats/":
+            return deepcopy(self.learning_stats)
         if path.startswith("/api/problems/"):
             if method == "PUT":
                 return {"id": path.rsplit("/", 1)[-1]}
@@ -475,6 +572,7 @@ def test_sidebar_native_icon_navigation_reaches_all_user_pages_without_mutation(
     assert [item.key for item in at.sidebar.button] == [
         "nav_problems",
         "nav_submissions",
+        "nav_analytics",
         "nav_authoring",
         "nav_account",
         "sidebar_logout",
@@ -482,6 +580,7 @@ def test_sidebar_native_icon_navigation_reaches_all_user_pages_without_mutation(
     assert at.button(key="nav_problems").proto.help == "当前页面"
     for key, page in (
         ("nav_submissions", "提交记录"),
+        ("nav_analytics", "成绩总览"),
         ("nav_account", "账户"),
         ("nav_authoring", "智能命题"),
         ("nav_problems", "题库"),
@@ -494,6 +593,7 @@ def test_sidebar_native_icon_navigation_reaches_all_user_pages_without_mutation(
     assert all(call[0] == "GET" for call in fake.calls)
     assert any(call[1] == "/api/ai/model-config" for call in fake.calls)
     assert any(call[1] == "/api/submissions/" for call in fake.calls)
+    assert any(call[1] == "/api/me/learning-stats/" for call in fake.calls)
 
 
 def test_sidebar_admin_entry_and_role_downgrade_fall_back_safely():
@@ -507,6 +607,165 @@ def test_sidebar_admin_entry_and_role_downgrade_fall_back_safely():
     assert not at.exception
     assert "nav_admin" not in [item.key for item in at.sidebar.button]
     assert at.session_state["navigation"] == "题库"
+
+
+def test_analytics_navigation_renders_one_private_statistics_payload():
+    fake = FakeAPI()
+
+    at = app(fake, page="成绩总览")
+
+    assert not at.exception
+    assert at.title[0].value == "学习统计"
+    assert sum(call[:2] == ("GET", "/api/me/learning-stats/") for call in fake.calls) == 1
+    bodies = [item.proto.body for item in at.get("html")]
+    assert any("oj-analytics-kpis" in body for body in bodies)
+    assert any("oj-analytics-table" in body for body in bodies)
+
+
+def test_catalog_uses_one_status_snapshot_for_multiple_problems_and_hides_private_fields():
+    fake = FakeAPI()
+    fake.problems.extend(
+        [
+            {**deepcopy(PROBLEM), "id": "legacy", "title": "旧难度", "difficulty": "medium"},
+            {**deepcopy(PROBLEM), "id": "advanced", "title": "进阶题", "difficulty": "提高"},
+        ]
+    )
+    fake.problem_statuses["items"].extend(
+        [
+            {
+                "problem_id": "legacy",
+                "state": "failed",
+                "latest_outcome": "compile_error",
+                "latest_terminal": {"status": "success"},
+            },
+            {
+                "problem_id": "advanced",
+                "state": "partial",
+                "latest_outcome": "time_limit",
+                "latest_terminal": {"status": "success"},
+            },
+        ]
+    )
+
+    at = app(fake)
+
+    assert not at.exception
+    assert sum(call[:2] == ("GET", "/api/me/problem-statuses/") for call in fake.calls) == 1
+    assert not any(call[1].startswith("/api/submissions") for call in fake.calls)
+    bodies = "".join(item.proto.body for item in at.get("html"))
+    assert "status-ac" in bodies and "status-compile" in bodies and "status-timeout" in bodies
+    assert "difficulty-red" in bodies and "difficulty-neutral" in bodies
+    assert "SECRET_STATUS_CODE" not in bodies
+    assert "SECRET_STATUS_CASE" not in bodies
+
+
+@pytest.mark.parametrize(
+    ("outcome", "css_class", "zh_label"),
+    [
+        ("accepted", "status-ac", "已通过"),
+        ("wrong_answer", "status-failed", "答案错误"),
+        ("partial", "status-partial", "部分通过"),
+        ("compile_error", "status-compile", "编译错误"),
+        ("time_limit", "status-timeout", "运行超时"),
+        ("memory_limit", "status-memory", "内存超限"),
+        ("runtime_error", "status-runtime", "运行错误"),
+        ("judge_error", "status-judge-error", "评测异常"),
+        ("pending", "status-pending", "判题中"),
+    ],
+)
+def test_catalog_verdict_badges_have_bounded_semantic_colors(outcome, css_class, zh_label):
+    source = deepcopy(PROBLEM_STATUSES)
+    source["items"][0].update(state="failed", latest_outcome=outcome)
+    status = problem_status_index(source)["sum"]
+
+    rendered = problem_badges_html(difficulty_projection("入门"), status)
+
+    assert css_class in rendered
+    assert zh_label in rendered
+
+
+def test_problem_status_projection_is_versioned_allow_list_and_badges_escape_input():
+    source = deepcopy(PROBLEM_STATUSES)
+    projected = problem_status_index(source)
+
+    assert projected == {
+        "sum": {"state": "passed", "latest_outcome": "accepted", "terminal_error": False}
+    }
+    assert problem_status_index({"schema_version": "future", "items": []}) is None
+    rendered = problem_badges_html(
+        {"label": "<img src=x onerror=alert(1)>", "token": "x' onclick='alert(1)"},
+        projected["sum"],
+    )
+    assert "<img" not in rendered and "onclick" not in rendered
+    assert "&lt;img src=x onerror=alert(1)&gt;" in rendered
+    assert "difficulty-neutral" in rendered
+
+
+def test_pending_current_attempt_and_outdated_problem_keep_honest_lifecycle_labels():
+    source = deepcopy(PROBLEM_STATUSES)
+    source["items"][0].update(state="passed", latest_outcome="pending")
+    pending = problem_status_index(source)["sum"]
+    assert "status-pending" in problem_badges_html(difficulty_projection("入门"), pending)
+
+    source["items"][0].update(state="outdated", latest_outcome="accepted")
+    outdated = problem_status_index(source)["sum"]
+    rendered = problem_badges_html(difficulty_projection("入门"), outdated)
+    assert "status-outdated" in rendered and "题目已更新" in rendered
+
+
+def test_legacy_difficulties_stay_neutral_and_use_one_display_language():
+    assert difficulty_projection("medium", "zh-CN") == {
+        "id": None,
+        "label": "旧制 · 中等",
+        "token": "difficulty-neutral",
+        "recognized": False,
+    }
+    assert difficulty_projection("基础", "en") == {
+        "id": None,
+        "label": "Legacy · Basic",
+        "token": "difficulty-neutral",
+        "recognized": False,
+    }
+    assert difficulty_projection("提高", "en")["label"] == "Intermediate"
+
+
+@pytest.mark.parametrize("status", [0, 403, 500])
+def test_catalog_status_failure_degrades_without_losing_the_problem_list(status):
+    fake = FakeAPI()
+    fake.failure = ("GET", "/api/me/problem-statuses/", status, "private backend failure")
+
+    at = app(fake)
+
+    assert not at.exception and at.title[0].value == "题库"
+    assert at.button(key="open_sum")
+    assert any("题库仍可正常浏览" in item.value for item in at.caption)
+    bodies = "".join(item.proto.body for item in at.get("html"))
+    assert "状态暂缺" in bodies and "private backend failure" not in bodies
+
+
+def test_progress_styles_are_responsive_accessible_and_reduced_motion_safe():
+    from frontend.styles import CSS
+
+    for selector in (
+        ".oj-analytics-kpis",
+        ".oj-analytics-grid-two",
+        ".oj-analytics-table-wrap",
+        ".oj-catalog-badges",
+        ".status-ac",
+        ".status-compile",
+        ".status-timeout",
+        ".state-passed",
+        ".state-outdated",
+        ".difficulty-red",
+        ".difficulty-purple",
+        ".difficulty-neutral",
+    ):
+        assert selector in CSS
+    assert "@media (max-width:860px)" in CSS
+    assert "@media (max-width:480px)" in CSS
+    reduced = CSS.split("@media (prefers-reduced-motion:reduce)", 1)[1]
+    assert "st-key-catalog_problem_" in reduced and "transform:none" in reduced
+    assert "linear-gradient" not in CSS
 
 
 def test_workspace_outer_and_current_route_slots_stay_stable_on_rerun():
