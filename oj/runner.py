@@ -141,6 +141,18 @@ def _kill_tree(process: subprocess.Popen, known: dict[int, psutil.Process]) -> N
     except psutil.Error:
         pass
     if os.name == "posix":
+        # A short-lived parent can exit between polls, so children() no longer
+        # sees its adopted descendants. The private session's process group
+        # survives that parent: retain its members before signalling the group
+        # so completion waits for them, not merely for delivery of SIGKILL.
+        for member in psutil.process_iter():
+            if member.pid == process.pid:
+                continue
+            try:
+                if os.getpgid(member.pid) == process.pid:
+                    known[member.pid] = member
+            except (ProcessLookupError, PermissionError):
+                continue
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -153,7 +165,25 @@ def _kill_tree(process: subprocess.Popen, known: dict[int, psutil.Process]) -> N
     if process.poll() is None:
         process.kill()
     process.wait(timeout=5)
-    psutil.wait_procs(list(known.values()), timeout=1)
+    # Adopted POSIX zombies are reaped by init, not this process; they cannot
+    # execute or hold scratch handles. Await actual termination of every known
+    # member, including descendants not seen by the resource sampling loop.
+    deadline = time.monotonic() + 1
+    remaining = list(known.values())
+    while remaining:
+        alive = []
+        for member in remaining:
+            try:
+                if member.is_running() and member.status() != psutil.STATUS_ZOMBIE:
+                    alive.append(member)
+            except psutil.NoSuchProcess:
+                pass
+        if not alive:
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Submission descendants did not terminate")
+        remaining = alive
+        time.sleep(POLL_INTERVAL)
 
 
 def _execute(

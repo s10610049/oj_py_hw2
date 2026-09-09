@@ -419,6 +419,31 @@ async def test_child_is_reaped_when_parent_exits(tmp_path):
     assert process_stopped(child_pid)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group ownership")
+@pytest.mark.asyncio
+async def test_cleanup_waits_for_orphan_missed_by_resource_poll(tmp_path, monkeypatch):
+    # Force the resource sampler to miss parent/child overlap; cleanup must use
+    # the private group, not depend on a fortunate children() polling schedule.
+    monkeypatch.setattr(psutil.Process, "children", lambda self, recursive=False: [])
+    for index in range(3):
+        marker = tmp_path / f"missed-{index}.json"
+        code = (
+            "import json,subprocess,sys\n"
+            "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+            f"with open({str(marker)!r},'w') as handle: json.dump(child.pid,handle)\n"
+            "print('done')\n"
+        )
+        result = await judge_submission(problem(expected="done"), PYTHON, code)
+        assert_verdict(result, "AC")
+        child_pid = json.loads(marker.read_text())
+        try:
+            assert process_stopped(child_pid)
+        finally:
+            # A broken candidate must not leave this regression's child alive.
+            if not process_stopped(child_pid):
+                psutil.Process(child_pid).kill()
+
+
 @pytest.mark.asyncio
 async def test_run_command_deadline_and_event_loop_remain_responsive(tmp_path):
     started = time.monotonic()
