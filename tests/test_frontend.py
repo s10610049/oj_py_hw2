@@ -432,6 +432,18 @@ def test_auth_styles_are_scoped_reduced_motion_and_keyboard_safe():
     assert "pointer-events:none" not in CSS and "visibility:hidden" not in CSS
 
 
+def test_framework_toolbar_is_minimal_and_only_exact_right_controls_are_hidden():
+    from frontend.styles import CSS
+
+    config = toml.loads((ROOT / ".streamlit/config.toml").read_text(encoding="utf-8"))
+    assert config["client"]["toolbarMode"] == "minimal"
+    assert 'header [data-testid="stToolbar"]' in CSS
+    assert 'header [data-testid="stAppDeployButton"]' in CSS
+    assert "#MainMenu" in CSS
+    assert '[data-testid="stSidebarCollapseButton"]' not in CSS
+    assert "header {display:none" not in CSS
+
+
 def test_auth_native_form_enter_labels_and_password_autocomplete():
     at = app(FakeAPI(), logged_in=False)
     assert at.get("form")[0].proto.form.enter_to_submit
@@ -603,7 +615,9 @@ def test_ai_polling_keeps_static_mark_separate_from_elapsed_status_and_phrase():
     assert markup('class="oj-mark"') == mark
     assert markup('class="oj-loading-title"') == title
     assert markup('class="oj-loading-note oj-phrase"') == phrase
-    assert "13 秒" in markup('class="oj-loading-note">已耗时')
+    elapsed = markup('class="oj-loading-note">已耗时')
+    assert "13 秒" in elapsed
+    assert "4 分钟" not in elapsed and "四分钟" not in elapsed
 
 
 def test_pathhub_theme_preserves_every_local_font_face():
@@ -638,6 +652,18 @@ def test_pathhub_motion_and_layout_contract_is_bounded_and_reducible():
     assert "st-key-route_content_" in reduced and "st-key-auth_stage_" in reduced
     assert "st-key-workspace_nav button" in reduced and "transform:none;" in reduced
     assert "transition:none;" in reduced
+
+
+def test_green_visual_hierarchy_is_semantic_and_restrained():
+    from frontend.styles import CSS
+
+    assert "--oj-border-accent:#BDD7C8" in CSS
+    assert "--oj-surface-tint:#F7FBF8" in CSS
+    assert '.st-key-workspace_shell [data-testid="stForm"]' in CSS
+    assert '.st-key-workspace_shell [data-testid="stMetric"]' in CSS
+    assert '.st-key-workspace_shell [data-testid="stExpander"]' in CSS
+    assert ".st-key-problem_prose" in CSS and "border-left:2px" in CSS
+    assert "linear-gradient" not in CSS
 
 
 def test_narrow_auth_hides_story_layout_wrapper_and_expands_only_form_wrapper():
@@ -915,7 +941,7 @@ def test_network_failure_keeps_real_last_task_state():
     assert not at.success
 
 
-def test_estimated_usage_explains_method_and_small_cost_is_not_rounded_to_zero():
+def test_estimated_usage_keeps_compact_metrics_without_verbose_accounting_copy():
     fake = FakeAPI()
     fake.task.update(status="cancelled")
     fake.task["usage"] = {
@@ -930,9 +956,52 @@ def test_estimated_usage_explains_method_and_small_cost_is_not_rounded_to_zero()
     }
     at = app(fake, page="智能命题", _ai_task=deepcopy(fake.task))
     assert not at.exception
-    assert any("UTF-8" in item.value for item in at.caption)
+    captions = "\n".join(item.value for item in at.caption)
+    for forbidden in (
+        "UTF-8",
+        "统计来源",
+        "费用不代表最终账单",
+        "统计尚不完整",
+        "单价未完整配置",
+        "费用 =",
+    ):
+        assert forbidden not in captions
+    assert [item.label for item in at.metric] == [
+        "输入 Token",
+        "输出 Token",
+        "总 Token",
+        "估算费用",
+    ]
     cost = next(item for item in at.metric if item.label == "估算费用")
     assert cost.value.startswith("1e-08")
+
+
+def test_removed_ai_timeout_and_account_font_copy_do_not_render_or_remain_in_sources():
+    fake = FakeAPI()
+    at = app(fake, page="智能命题")
+    rendered = "\n".join(
+        [item.value for item in at.caption] + [item.label for item in at.get("expander")]
+    )
+    assert "4 分钟" not in rendered and "四分钟" not in rendered
+
+    at = app(fake, page="账户")
+    assert "阅读与字体" not in [item.label for item in at.get("expander")]
+
+    sources = "\n".join(
+        (ROOT / path).read_text(encoding="utf-8")
+        for path in ("frontend/ai_page.py", "frontend/accounts.py", "frontend/styles.py")
+    )
+    for forbidden in (
+        "后台异步处理，最长 4 分钟",
+        "最长 4 分钟",
+        "最多四分钟",
+        "阅读与字体",
+        "统计来源：",
+        "费用不代表最终账单",
+        "统计尚不完整",
+        "单价未完整配置",
+    ):
+        assert forbidden not in sources
 
 
 def test_submission_list_and_account_use_backend_data():

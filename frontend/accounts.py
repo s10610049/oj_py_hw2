@@ -211,12 +211,6 @@ def account_page():
     st.divider()
     if st.button("退出登录", key="account_logout"):
         logout()
-    with st.expander("阅读与字体"):
-        st.write(
-            "英文、中文与代码分别使用本地 Manrope、Noto Sans SC 与 JetBrains Mono。"
-            "中文覆盖官方本次字体分片字集，缺字自动使用系统字体，不依赖 Google 外网。"
-            "可使用浏览器缩放调整阅读大小。"
-        )
 
 
 def users_page():

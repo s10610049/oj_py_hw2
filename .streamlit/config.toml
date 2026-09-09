@@ -5,6 +5,9 @@ enableStaticServing = true
 [browser]
 gatherUsageStats = false
 
+[client]
+toolbarMode = "minimal"
+
 [theme]
 base = "light"
 primaryColor = "#1A6B4A"

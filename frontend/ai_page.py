@@ -95,26 +95,6 @@ def usage_display(usage):
         "估算费用",
         "未知" if cost is None else f"{cost:.8g} {usage.get('currency', '')}",
     )
-    source_label = {
-        "provider": "提供商返回",
-        "provider_partial": "提供商返回部分用量",
-        "estimated": "本地粗估",
-        "unavailable": "尚未返回",
-        "mixed": "多次请求，提供商计数与本地估算混合",
-    }.get(source, source)
-    st.caption(f"统计来源：{source_label}。费用不代表最终账单。")
-    if usage.get("incomplete"):
-        st.caption("统计尚不完整，最终用量可能更高。")
-    if usage.get("note"):
-        st.caption(str(usage["note"]))
-    if usage.get("input_price") is not None and usage.get("output_price") is not None:
-        st.caption(
-            f"计价：每 {usage.get('price_unit', '未知')} Token，输入 {usage['input_price']}、"
-            f"输出 {usage['output_price']} {usage.get('currency', '')}。"
-            "费用 = 输入 Token ÷ 单位 × 输入单价 + 输出 Token ÷ 单位 × 输出单价。"
-        )
-    else:
-        st.caption("单价未完整配置，不能据此认定本次调用免费。")
 
 
 def task_panel():
@@ -250,7 +230,6 @@ def ai_page():
             "参考题号（可选）",
             help="填写题库中已有题号，模型可参考该题；生成后仍需明确选择新增或更新。",
         )
-        st.caption("后台异步处理，最长 4 分钟；期间可查看真实进度并停止任务。")
         started = st.form_submit_button("生成题目", type="primary", disabled=active)
     if started:
         if not requirement.strip():

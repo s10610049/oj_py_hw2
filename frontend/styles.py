@@ -10,12 +10,19 @@ CSS = """
    AuthLayout.tsx. Keep our local font stack, own brand and real native widgets. */
 :root {--oj-primary:#1A6B4A;--oj-primary-dark:#0F4A32;--oj-primary-soft:#EBF5F0;
   --oj-bg:#F5F5F7;--oj-surface:#FFFFFF;--oj-text:#1D1D1F;--oj-muted:#6E6E73;
-  --oj-border:#E8E8ED;--oj-ease:cubic-bezier(.2,0,0,1);}
+  --oj-border:#E8E8ED;--oj-border-accent:#BDD7C8;--oj-border-accent-strong:#7FA68F;
+  --oj-surface-tint:#F7FBF8;--oj-focus-ring:rgba(26,107,74,.13);
+  --oj-ease:cubic-bezier(.2,0,0,1);}
+/* Streamlit 1.63's supported minimal toolbar mode is the primary control.
+   These exact framework selectors prevent a transient Deploy/menu flash while
+   deliberately preserving the header and the sidebar collapse control. */
+header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainMenu {
+  display:none;}
 .oj-brand {font-size:20px;font-weight:500;color:var(--oj-text);margin:0;line-height:1.4;}
 .oj-eyebrow {color:var(--oj-muted);font-size:10px;letter-spacing:.09em;margin:5px 0 0;}
 .oj-meta {color:#48484A;font-size:14px;line-height:1.7;margin:8px 0 20px;}
-.oj-table-scroll {overflow-x:auto;margin:12px 0 20px;border:1px solid var(--oj-border);
-  border-radius:12px;background:var(--oj-surface);}
+.oj-table-scroll {overflow-x:auto;margin:12px 0 20px;border:1px solid var(--oj-border-accent);
+  border-radius:12px;background:var(--oj-surface);box-shadow:0 1px 0 rgba(15,74,50,.03);}
 .oj-table {width:100%; border-collapse:collapse; font-size:14px; line-height:22px;
   color:var(--oj-text); font-variant-numeric:tabular-nums;}
 .oj-table th {background:#F8F9FA;font-weight:500;text-align:left;white-space:nowrap;}
@@ -47,7 +54,8 @@ CSS = """
 .st-key-code_editor textarea { font-family:'JetBrains Mono',Consolas,monospace;
   font-size:15px; line-height:1.6; tab-size:4; font-variant-ligatures:none; }
 .st-key-problem_prose p, .st-key-problem_prose li { font-size:17px;line-height:1.76; }
-.st-key-problem_prose { max-width:768px; }
+.st-key-problem_prose {max-width:768px;padding-left:20px;
+  border-left:2px solid var(--oj-border-accent);}
 /* Native navigation buttons replace radio circles. Active state is also named
    in its accessible help and the main breadcrumb, not conveyed by color alone. */
 .st-key-workspace_nav {min-height:calc(100dvh - 8rem);gap:1rem;
@@ -78,11 +86,25 @@ CSS = """
 .st-key-workspace_shell {max-width:1240px;margin-inline:auto;min-height:calc(100dvh - 9rem);}
 .oj-workspace-header {display:flex;align-items:center;justify-content:space-between;
   gap:16px;min-height:36px;padding-bottom:16px;margin-bottom:8px;
-  border-bottom:1px solid var(--oj-border);font-size:12px;color:var(--oj-muted);}
+  border-bottom:1px solid var(--oj-border-accent);font-size:12px;color:var(--oj-muted);}
 .oj-workspace-header strong {font-weight:500;color:#48484A;}
-.oj-context-badge {padding:4px 10px;border-radius:100px;background:#EBEFEF;
-  color:#52625B;font-size:11px;white-space:nowrap;}
+.oj-context-badge {padding:4px 10px;border:1px solid #D7E8DF;border-radius:100px;
+  background:var(--oj-primary-soft);color:#436653;font-size:11px;white-space:nowrap;}
 .st-key-workspace_shell h1,.st-key-workspace_shell h2,.st-key-auth_shell h1 {font-weight:500;}
+.st-key-workspace_shell [data-testid="stForm"] {padding:clamp(16px,2vw,22px);
+  border:1px solid var(--oj-border-accent);border-radius:16px;background:var(--oj-surface);
+  box-shadow:0 1px 0 rgba(15,74,50,.025);
+  transition:border-color 180ms var(--oj-ease),box-shadow 180ms var(--oj-ease);}
+.st-key-workspace_shell [data-testid="stForm"]:focus-within {
+  border-color:var(--oj-border-accent-strong);box-shadow:0 0 0 3px var(--oj-focus-ring);}
+.st-key-workspace_shell [data-testid="stMetric"] {min-height:94px;padding:14px 16px;
+  border:1px solid #DDEAE3;border-radius:14px;background:var(--oj-surface-tint);}
+.st-key-workspace_shell [data-testid="stExpander"] {border-color:#D7E5DD;
+  background:rgba(247,251,248,.56);}
+.st-key-workspace_shell [data-baseweb="input"]:focus-within,
+.st-key-workspace_shell [data-baseweb="textarea"]:focus-within,
+.st-key-workspace_shell [data-baseweb="select"]:focus-within {
+  border-color:var(--oj-border-accent-strong);box-shadow:0 0 0 3px var(--oj-focus-ring);}
 .st-key-workspace_shell [class*="st-key-route_content_"] {
   min-height:30rem;animation:oj-route-problems 220ms var(--oj-ease);}
 .st-key-workspace_shell .st-key-route_content_submissions {animation-name:oj-route-submissions;}
@@ -162,7 +184,7 @@ CSS = """
   .st-key-workspace_shell [class*="st-key-route_content_"],.st-key-workspace_nav {
     animation:none;opacity:1;transform:none;}
   .st-key-auth_shell button,.st-key-workspace_nav button,.st-key-workspace_shell button,
-  .oj-table tbody tr {transition:none;}
+  .st-key-workspace_shell [data-testid="stForm"],.oj-table tbody tr {transition:none;}
   .st-key-auth_shell button:not(:disabled):active,
   .st-key-workspace_nav button:not(:disabled):active,
   .st-key-workspace_shell button:not(:disabled):active {transform:none;}
@@ -280,9 +302,7 @@ def loading(progress, elapsed):
                 + html.escape(str(progress or "正在等待任务更新"))
                 + "</div>"
             )
-            st.html(
-                '<div class="oj-loading-note">已耗时 ' + f"{elapsed:.0f} 秒 · 最长 4 分钟</div>"
-            )
+            st.html('<div class="oj-loading-note">已耗时 ' + f"{elapsed:.0f} 秒</div>")
             st.html(
                 '<div class="oj-loading-note oj-phrase" aria-hidden="true">' + phrase + "</div>"
             )
