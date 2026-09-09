@@ -33,7 +33,22 @@ class Store:
                 if fetch == "all":
                     return [json.loads(row[0]) for row in cursor.fetchall()]
 
-        return await asyncio.to_thread(run)
+        worker = asyncio.create_task(asyncio.to_thread(run))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Cancelling an await cannot stop SQLite's worker thread. Keep the
+            # caller's mutation lock until its transaction really has finished.
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                worker.result()
+            except Exception:
+                pass
+            raise
 
     async def get(self, namespace, key):
         return await self._query(

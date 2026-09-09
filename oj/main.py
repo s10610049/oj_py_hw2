@@ -17,6 +17,7 @@ from dotenv import dotenv_values
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
+from starlette.requests import ClientDisconnect
 
 from oj.common import APIError, response
 from oj.schemas import identifier, paginate, pagination, text_field, validate_problem
@@ -39,15 +40,24 @@ def password_bytes(password):
     return base64.b64encode(hashlib.sha256(password.encode("utf-8")).digest())
 
 
-async def body_object(request):
+async def read_body(request):
     chunks = bytearray()
     async for chunk in request.stream():
-        chunks.extend(chunk)
-        if len(chunks) > 8_000_000:
+        if len(chunks) + len(chunk) > 8_000_000:
             raise APIError(400, "Request body is too large")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+async def body_object(request):
+    if getattr(request.state, "body_error", None):
+        raise request.state.body_error
+    chunks = getattr(request.state, "buffered_body", None)
+    if chunks is None:
+        chunks = await read_body(request)
     try:
         value = json.loads(chunks)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         raise APIError(400, "Invalid JSON body") from None
     if not isinstance(value, dict):
         raise APIError(400, "JSON body must be an object")
@@ -80,6 +90,7 @@ def load_ai_config():
 def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
     store = Store(database_path or os.environ.get("OJ_DATABASE", "runtime/oj.sqlite3"))
     mutation = asyncio.Lock()
+    lifecycle = asyncio.Lock()
     jobs = {}
     recent_submissions = {}
 
@@ -139,6 +150,30 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
     application = FastAPI(title="OJ · 编程练习室", version="1.0.0", lifespan=lifespan)
     application.state.store = store
     application.state.jobs = jobs
+
+    @application.middleware("http")
+    async def serialize_mutations(request, call_next):
+        writes = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        if writes:
+            # Untrusted/slow uploads must never hold the lifecycle lock. Delay
+            # validation errors until AFTER route authentication (401 > 403 > 400).
+            try:
+                request.state.buffered_body = await asyncio.wait_for(read_body(request), 10)
+            except APIError as error:
+                request.state.body_error = error
+            except (asyncio.TimeoutError, ClientDisconnect):
+                request.state.body_error = APIError(400, "Request body incomplete or timed out")
+        if request.method == "PUT" and request.url.path == "/api/ai/model-config":
+            # DNS/configuration may wait on the network; bind to this service
+            # generation instead of blocking unrelated cancellation or reset.
+            request.state.ai_service = application.state.ai
+            return await call_next(request)
+        if writes or request.url.path.endswith("/log"):
+            # Authentication happens inside this lock, so a reset invalidates
+            # sessions for any delayed upload before it can reach a mutation.
+            async with lifecycle:
+                return await call_next(request)
+        return await call_next(request)
 
     @application.exception_handler(APIError)
     async def expected_error(request, exc):
@@ -498,6 +533,14 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
 
     @application.put("/api/submissions/{submission_id}/rejudge")
     async def rejudge(submission_id: str, user=Depends(administrator)):
+        # Validate dependencies before stopping a valid in-flight snapshot.
+        record = await store.get("submissions", submission_id)
+        if not record:
+            raise APIError(404, "Submission not found")
+        problem = await store.get("problems", record["problem_id"])
+        language = await store.get("languages", record["language"])
+        if not problem or not language:
+            raise APIError(404, "Problem or language no longer exists")
         old_task = jobs.get(submission_id)
         if old_task:
             old_task.cancel()
@@ -536,7 +579,9 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
                 raise APIError(404, "Problem not found")
             problem["public_cases"] = public
             await store.put("problems", problem_id, problem)
-        return response({"problem_id": problem_id, "public_cases": public})
+        return response(
+            {"problem_id": problem_id, "public_cases": public}, "log visibility updated"
+        )
 
     @application.get("/api/submissions/{submission_id}/log")
     async def submission_log(submission_id: str, user=Depends(current_user)):
@@ -581,9 +626,11 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
 
     @application.put("/api/ai/model-config")
     async def configure_ai(request: Request, user=Depends(current_user)):
-        return response(
-            await application.state.ai.configure(user["user_id"], await body_object(request))
-        )
+        service = request.state.ai_service
+        result = await service.configure(user["user_id"], await body_object(request))
+        if service is not application.state.ai:
+            raise APIError(409, "Configuration invalidated by reset; please log in again")
+        return response(result)
 
     @application.post("/api/ai/problem-tasks/")
     async def start_ai(request: Request, user=Depends(current_user)):

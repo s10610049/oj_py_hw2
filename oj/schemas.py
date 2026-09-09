@@ -13,6 +13,10 @@ def text_field(value, field, *, minimum=1, maximum=200_000):
         raise APIError(400, f"Invalid {field}")
     if minimum and not value.strip():
         raise APIError(400, f"Invalid {field}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise APIError(400, f"Invalid {field} encoding") from None
     return value
 
 
