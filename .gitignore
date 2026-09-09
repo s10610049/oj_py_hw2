@@ -1,0 +1,48 @@
+# Local project memory and collaboration material
+/docs/
+/codex-workflow/
+/AGENTS.md
+/PROJECT.md
+/PROJECT_STATE.md
+/HANDOFF.md
+
+# Credentials (only the empty example is versioned)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments, caches and build output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Local execution state; problem/test fixtures are not ignored wholesale
+/runtime/
+/logs/
+*.log
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite3-journal
+*.sqlite-wal
+*.sqlite3-wal
+*.sqlite-shm
+*.sqlite3-shm
+
+# Editor and operating-system state
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
