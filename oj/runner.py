@@ -164,6 +164,7 @@ def _execute(
     memory_limit: int,
     output_limit: int,
     cancel: threading.Event,
+    memory_evidence: Path | None,
 ) -> ProcessResult:
     command = argv
     if sys.platform.startswith("linux"):
@@ -258,6 +259,14 @@ def _execute(
             error_file.seek(0)
             result.stdout = output_file.read(output_limit).decode("utf-8", errors="replace")
             result.stderr = error_file.read(output_limit).decode("utf-8", errors="replace")
+            if result.reason == "ok" and memory_evidence is not None:
+                try:
+                    with memory_evidence.open("rb") as evidence:
+                        # The bounded probe channel is separate from user stdout/stderr.
+                        if evidence.read(5) == b"OOM\n":
+                            result.reason = "memory"
+                except FileNotFoundError:
+                    pass
     return result
 
 
@@ -268,12 +277,22 @@ async def run_command(
     time_limit: float,
     memory_limit: int,
     output_limit: int = OUTPUT_LIMIT,
+    *,
+    memory_evidence: Path | None = None,
 ) -> ProcessResult:
     """Cancellation waits for the worker to kill descendants before scratch cleanup."""
     cancel = threading.Event()
     worker = asyncio.create_task(
         asyncio.to_thread(
-            _execute, argv, directory, stdin, time_limit, memory_limit, output_limit, cancel
+            _execute,
+            argv,
+            directory,
+            stdin,
+            time_limit,
+            memory_limit,
+            output_limit,
+            cancel,
+            memory_evidence,
         )
     )
     try:

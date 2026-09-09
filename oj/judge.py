@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 from pathlib import Path
@@ -164,8 +165,6 @@ def _classification(result: ProcessResult, *, compile_stage: bool = False) -> st
     if result.reason == "output":
         return "RE"
     if result.returncode:
-        if "MemoryError" in result.stderr or "std::bad_alloc" in result.stderr:
-            return "MLE"
         return "RE"
     return "AC"
 
@@ -196,10 +195,24 @@ async def judge_submission(problem: dict, language: dict, code: str) -> dict:
             directory = Path(temporary)
             source = directory / ("main" + language["file_ext"])
             executable = directory / ("program.exe" if os.name == "nt" else "program")
+            memory_evidence = directory / "allocation-evidence"
             source.write_text(code, encoding="utf-8")
             if language["compile_cmd"]:
+                compile_argv = _argv(language["compile_cmd"], source, executable)
+                if sys.platform.startswith("linux") and _executable_name(compile_argv[0]) in {
+                    "g++",
+                    "clang++",
+                }:
+                    header = Path(__file__).with_name("cpp_memory_probe.hpp").resolve()
+                    compile_argv.extend(
+                        [
+                            "-include",
+                            str(header),
+                            "-DOJ_MEMORY_SIGNAL_PATH=" + json.dumps(str(memory_evidence)),
+                        ]
+                    )
                 compile_result = await run_command(
-                    _argv(language["compile_cmd"], source, executable),
+                    compile_argv,
                     directory,
                     "",
                     COMPILE_TIMEOUT,
@@ -227,12 +240,21 @@ async def judge_submission(problem: dict, language: dict, code: str) -> dict:
             errors = []
             diagnostic = ""
             for index, case in enumerate(cases, 1):
+                memory_evidence.unlink(missing_ok=True)
+                run_argv = _argv(language["run_cmd"], source, executable)
+                is_current_python = os.path.normcase(
+                    os.path.abspath(run_argv[0])
+                ) == os.path.normcase(os.path.abspath(sys.executable))
+                if is_current_python:
+                    wrapper = Path(__file__).with_name("python_runner.py").resolve()
+                    run_argv = [*run_argv[:-1], str(wrapper), str(memory_evidence), str(source)]
                 result = await run_command(
-                    _argv(language["run_cmd"], source, executable),
+                    run_argv,
                     directory,
                     case["input"],
                     time_limit,
                     memory_limit,
+                    memory_evidence=memory_evidence,
                 )
                 verdict = _classification(result)
                 if verdict == "AC" and normalize_output(result.stdout) != normalize_output(

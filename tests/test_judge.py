@@ -44,6 +44,22 @@ def assert_verdict(result, verdict, count=1):
         assert detail["time"] >= 0 and detail["memory"] >= 0
 
 
+def process_stopped(pid):
+    # Process disappearance during inspection is successful cleanup, not a failure.
+    try:
+        return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return True
+
+
+def test_process_stopped_handles_concurrent_reaping(monkeypatch):
+    def reaped(pid):
+        raise psutil.NoSuchProcess(pid)
+
+    monkeypatch.setattr(psutil, "Process", reaped)
+    assert process_stopped(123456)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -114,6 +130,118 @@ async def test_python_real_verdicts(code, expected, verdict):
     assert_verdict(result, verdict)
     assert result["compile_info"] is None
     assert result["run_info"]["result"] == "finished"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    [
+        "raise ValueError('MemoryError')",
+        "raise ValueError('std::bad_alloc')",
+        "raise ValueError('ordinary error\\nMemoryError')",
+        "raise ValueError('ordinary error') # MemoryError",
+        "raise MemoryError",
+        "raise MemoryError('deliberate exception, no allocation')",
+        "try:\n raise MemoryError\nexcept MemoryError:\n raise ValueError('final error')",
+        "def values():\n yield 1\ng=values()\nnext(g)\ng.throw(MemoryError)",
+        pytest.param(
+            "def values():\n yield 1\ng=values()\ng.throw(MemoryError)",
+            id="unstarted-generator-injection",
+        ),
+        pytest.param(
+            "import asyncio\nloop=asyncio.new_event_loop()\n"
+            "try:\n f=loop.create_future()\n f.set_exception(MemoryError())\n f.result()\n"
+            "finally:\n loop.close()",
+            id="future-result-replay",
+        ),
+    ],
+)
+async def test_memory_words_and_manual_exceptions_are_not_resource_evidence(code):
+    result = await judge_submission(problem(), PYTHON, code)
+    assert_verdict(result, "RE")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("g++") is None, reason="C++ compiler is not installed")
+async def test_manually_thrown_bad_alloc_is_not_memory_exhaustion():
+    code = (
+        "#include <new>\n#include <exception>\n#include <cstdio>\n#include <cstdlib>\n"
+        "int main(){\n#ifdef _WIN32\n"
+        'std::set_terminate([](){std::fputs("std::bad_alloc\\n",stderr);std::_Exit(1);});\n'
+        "#endif\nthrow std::bad_alloc();}"
+    )
+    result = await judge_submission(problem(), CPP, code)
+    if os.name == "nt" and "execution policy" in (result["error_info"] or ""):
+        pytest.skip(result["error_info"])
+    assert_verdict(result, "RE")
+
+
+@pytest.mark.asyncio
+async def test_actual_allocation_failure_without_memory_keywords():
+    result = await judge_submission(problem(), PYTHON, "value=bytearray(2**63-1)")
+    assert_verdict(result, "MLE")
+
+
+@pytest.mark.asyncio
+async def test_future_replay_preserves_original_allocation_failure():
+    code = (
+        "import asyncio\nloop=asyncio.new_event_loop()\n"
+        "try:\n f=loop.create_future()\n"
+        " try:\n  value=bytearray(2**63-1)\n"
+        " except MemoryError as error:\n  f.set_exception(error)\n"
+        " f.result()\nfinally:\n loop.close()"
+    )
+    assert_verdict(await judge_submission(problem(), PYTHON, code), "MLE")
+
+
+@pytest.mark.asyncio
+async def test_future_probe_does_not_replace_pending_or_cancelled_errors():
+    code = (
+        "import asyncio\nloop=asyncio.new_event_loop()\n"
+        "try:\n f=loop.create_future()\n"
+        " try:\n  f.result()\n except asyncio.InvalidStateError:\n  pass\n"
+        " f.cancel()\n"
+        " try:\n  f.result()\n except asyncio.CancelledError:\n  pass\n"
+        " value=bytearray(2**63-1)\nfinally:\n loop.close()"
+    )
+    assert_verdict(await judge_submission(problem(), PYTHON, code), "MLE")
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Requires real Linux rlimits")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "code"),
+    [
+        (PYTHON, "value=bytearray(128*1024*1024)"),
+        (
+            CPP,
+            "int main(){volatile char* p=new char[128*1024*1024];p[0]=1;return p[0];}",
+        ),
+    ],
+)
+async def test_linux_single_allocation_reports_limit_failure_without_peak_crossing(language, code):
+    result = await judge_submission(problem(memory=64), language, code)
+    assert_verdict(result, "MLE")
+    # RLIMIT_AS refuses the allocation before RSS can cross the configured limit.
+    assert result["details"][0]["memory"] < 64
+
+
+@pytest.mark.asyncio
+async def test_python_probe_preserves_script_entry_semantics():
+    code = (
+        "import pathlib,sys,__main__,atexit\n"
+        "assert __name__ == '__main__'\n"
+        "assert pathlib.Path(sys.argv[0]) == pathlib.Path(__file__)\n"
+        "assert len(sys.argv) == 1\n"
+        "assert __main__.__file__ == __file__\n"
+        "value='exit-ok'\n"
+        "def on_exit():\n import __main__\n print(__main__.value)\n"
+        "atexit.register(on_exit)\n"
+        "print('entry-ok')"
+    )
+    assert_verdict(
+        await judge_submission(problem(expected="entry-ok\nexit-ok"), PYTHON, code), "AC"
+    )
 
 
 @pytest.mark.asyncio
@@ -272,10 +400,7 @@ async def test_cancellation_kills_child_and_removes_scratch(tmp_path):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert (
-        not psutil.pid_exists(child_pid)
-        or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
-    )
+    assert process_stopped(child_pid)
     assert not Path(directory).exists()
 
 
@@ -291,10 +416,7 @@ async def test_child_is_reaped_when_parent_exits(tmp_path):
     result = await judge_submission(problem(expected="done"), PYTHON, code)
     assert_verdict(result, "AC")
     child_pid = json.loads(marker.read_text())
-    assert (
-        not psutil.pid_exists(child_pid)
-        or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
-    )
+    assert process_stopped(child_pid)
 
 
 @pytest.mark.asyncio
