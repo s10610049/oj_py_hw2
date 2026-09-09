@@ -563,6 +563,249 @@ DEMO_PROBLEMS = [
 ]
 
 
+def english_statement(title, description, inputs, outputs, constraints):
+    return {
+        "title": title,
+        "description": description,
+        "input_description": inputs,
+        "output_description": outputs,
+        "constraints": constraints,
+        "hint": "Start with the samples, then check the boundary cases.",
+    }
+
+
+DEMO_ENGLISH = {
+    "DEMO-001": english_statement(
+        "Two Ledger Entries",
+        "Two integer amounts were added to a ledger. Income is positive and spending is "
+        "negative. Compute their total.",
+        "One line contains two integers a and b separated by a space.",
+        "Print one integer: a + b.",
+        "−10⁹ ≤ a, b ≤ 10⁹.",
+    ),
+    "DEMO-002": english_statement(
+        "Consecutive Sunny Days",
+        "A weather record uses 1 for a sunny day and 0 otherwise. Given records for n "
+        "consecutive days, find the longest run of sunny days.",
+        "The first line contains n. The second line contains n integers, each 0 or 1.",
+        "Print the length of the longest consecutive run of 1s, or 0 if there is none.",
+        "1 ≤ n ≤ 100000.",
+    ),
+    "DEMO-003": english_statement(
+        "Reading Plan",
+        "Each book has an integer page count. For every query, find the total pages from "
+        "book l through book r, inclusive.",
+        "The first line contains n and q. The second line contains n non-negative page "
+        "counts. Each of the next q lines contains l and r; indexing starts at 1.",
+        "Print the total for each query on its own line.",
+        "1 ≤ n, q ≤ 100000; 0 ≤ pages ≤ 10⁹; 1 ≤ l ≤ r ≤ n.",
+    ),
+    "DEMO-004": english_statement(
+        "Task Dependencies",
+        "A task may require another task to finish first. Determine whether the given "
+        "dependencies contain a cycle. An edge u → v means u must finish before v; no "
+        "real threads need to be started.",
+        "The first line contains n and m. Each of the next m lines contains a directed "
+        "dependency u v.",
+        "Print YES if a directed cycle exists; otherwise print NO.",
+        "1 ≤ n ≤ 100000; 0 ≤ m ≤ 200000; 1 ≤ u, v ≤ n. Self-loops and duplicate edges "
+        "are allowed.",
+    ),
+    "DEMO-005": english_statement(
+        "Packing the Warehouse",
+        "A warehouse has n items and each box can hold at most k items. Items cannot be "
+        "split, and the last box may be partly filled. Find the minimum number of boxes; "
+        "zero items require zero boxes.",
+        "One line contains two integers n and k.",
+        "Print the minimum number of boxes.",
+        "0 ≤ n ≤ 10¹⁸; 1 ≤ k ≤ 10⁹.",
+    ),
+    "DEMO-006": english_statement(
+        "Training Grade",
+        "A training score is an integer s. Scores of at least 90 receive A, 75 through 89 "
+        "receive B, 60 through 74 receive C, and lower scores receive D. Determine the grade.",
+        "One line contains the integer s.",
+        "Print one uppercase letter: A, B, C, or D.",
+        "0 ≤ s ≤ 100.",
+    ),
+    "DEMO-007": english_statement(
+        "ID Checksum",
+        "The checksum of a non-negative integer ID is the sum of its decimal digits. For "
+        "example, the checksum of 5030 is 5+0+3+0=8. Compute the checksum of the given ID.",
+        "One line contains a non-negative integer n without unnecessary leading zeros.",
+        "Print the sum of its decimal digits.",
+        "0 ≤ n ≤ 10¹⁸.",
+    ),
+    "DEMO-008": english_statement(
+        "Trailing Zeros of a Factorial",
+        "Define n! as the product of the integers from 1 through n, with 0!=1. Find the "
+        "number of consecutive zeros at the end of the decimal representation of n!. Do "
+        "not print the factorial itself.",
+        "One line contains the integer n.",
+        "Print the number of trailing zeros.",
+        "0 ≤ n ≤ 10⁹.",
+    ),
+    "DEMO-009": english_statement(
+        "Mirror Passphrase",
+        "A passphrase contains only lowercase English letters. It is a mirror passphrase "
+        "when it reads exactly the same from left to right and from right to left. Decide "
+        "whether the given passphrase qualifies.",
+        "One line contains a non-empty string s.",
+        "Print YES for a mirror passphrase; otherwise print NO.",
+        "1 ≤ |s| ≤ 100000; every character is between a and z.",
+    ),
+    "DEMO-010": english_statement(
+        "Most Frequent Letter",
+        "Count each letter in a lowercase string. Select a letter with the highest count; "
+        "if several tie, select the alphabetically earliest one.",
+        "One line contains a non-empty lowercase string s.",
+        "Print the selected letter and its count, separated by one space.",
+        "1 ≤ |s| ≤ 100000; every character is between a and z.",
+    ),
+    "DEMO-011": english_statement(
+        "Sign Run Compression",
+        "A lowercase string records signs along a route. Replace each maximal run of the "
+        "same letter with that letter followed by the run length: aaabb becomes a3 b2. "
+        "A run of length one must still include the digit 1.",
+        "One line contains a non-empty lowercase string s.",
+        "Print the letter and length of every run from left to right, separating adjacent "
+        "runs with one space.",
+        "1 ≤ |s| ≤ 100000; every character is between a and z.",
+    ),
+    "DEMO-012": english_statement(
+        "Second Distinct Height",
+        "Given n observed heights, repeated values count as one distinct height. Find the "
+        "largest height strictly below the maximum. If fewer than two distinct heights "
+        "exist, print NONE.",
+        "The first line contains n. The second line contains n integer heights.",
+        "Print the second-largest distinct height, or the uppercase word NONE.",
+        "1 ≤ n ≤ 100000; −10⁹ ≤ height ≤ 10⁹.",
+    ),
+    "DEMO-013": english_statement(
+        "Circular Display Board",
+        "A display board contains n integers in order. One right rotation moves the last "
+        "integer to the front and shifts all others one position right. Find the order "
+        "after k consecutive right rotations.",
+        "The first line contains n and k. The second line contains n integers.",
+        "Print the n integers after the rotations, separated by spaces.",
+        "1 ≤ n ≤ 100000; 0 ≤ k ≤ 10¹⁸; each value has absolute value at most 10⁹.",
+    ),
+    "DEMO-014": english_statement(
+        "Morning Run Ranking",
+        "The n students are numbered 1 through n in input order and each has a training "
+        "score. Rank them by decreasing score; ties are broken by smaller student number.",
+        "The first line contains n. The second line contains n non-negative scores.",
+        "Print the student numbers in ranking order, separated by spaces.",
+        "1 ≤ n ≤ 100000; 0 ≤ score ≤ 10⁹.",
+    ),
+    "DEMO-015": english_statement(
+        "Inspection Segments",
+        "There are n closed intervals on a number line. Merge intersecting intervals; "
+        "sharing an endpoint counts as intersection. After all merges, find the number of "
+        "disjoint segments. Integer intervals that are merely adjacent without sharing a "
+        "point are not merged.",
+        "The first line contains n. Each of the next n lines contains l and r for the "
+        "closed interval [l,r].",
+        "Print the number of segments after merging.",
+        "1 ≤ n ≤ 100000; −10⁹ ≤ l ≤ r ≤ 10⁹.",
+    ),
+    "DEMO-016": english_statement(
+        "Bookshelf Position",
+        "Book IDs are in non-decreasing order and may repeat. For each target x, find the "
+        "first position whose ID is at least x. Positions start at 1; return n+1 if no "
+        "such position exists.",
+        "The first line contains n and q. The second line contains n sorted integers. Each "
+        "of the next q lines contains one target x.",
+        "Print the position for each query on its own line.",
+        "1 ≤ n, q ≤ 100000; every ID and x has absolute value at most 10⁹.",
+    ),
+    "DEMO-017": english_statement(
+        "Moving Piles",
+        "A warehouse has n piles and pile i contains aᵢ items. At a positive integer speed "
+        "k, each pile separately takes ceil(aᵢ/k) whole hours; leftover capacity from "
+        "different piles cannot be combined in one hour. Find the minimum speed that "
+        "finishes every pile within h hours.",
+        "The first line contains n and h. The second line contains n positive integers aᵢ.",
+        "Print the minimum positive integer speed k.",
+        "1 ≤ n ≤ 10000; n ≤ h ≤ 10¹⁸; 1 ≤ aᵢ ≤ 10⁹.",
+    ),
+    "DEMO-018": english_statement(
+        "Bracket Checkpoint",
+        "A record contains only parentheses, square brackets, and braces. Every opening "
+        "bracket must match a closing bracket of the same type in last-in-first-out order, "
+        "and no bracket may remain unmatched. Decide whether the whole record is valid.",
+        "One line contains a non-empty bracket string s.",
+        "Print YES if every bracket is matched; otherwise print NO.",
+        "1 ≤ |s| ≤ 100000; characters are limited to ()[]{}.",
+    ),
+    "DEMO-019": english_statement(
+        "Service Counter",
+        "A counter uses a first-in-first-out queue that is initially empty. PUSH x adds x "
+        "at the back; POP removes and prints the front; FRONT only prints the front. POP "
+        "or FRONT on an empty queue prints EMPTY and leaves it empty.",
+        "The first line contains q. Each of the next q lines is PUSH x, POP, or FRONT.",
+        "Print one line for every POP or FRONT. PUSH prints nothing. If no query or removal "
+        "operation occurs, print nothing.",
+        "1 ≤ q ≤ 100000; −10⁹ ≤ x ≤ 10⁹.",
+    ),
+    "DEMO-020": english_statement(
+        "Shared Meeting Room",
+        "One meeting room receives n bookings, each occupying a half-open interval [s,e). "
+        "Select a subset in which no two bookings overlap. A booking may start exactly "
+        "when the previous one ends. Find the maximum number that can be accepted.",
+        "The first line contains n. Each of the next n lines contains s and e.",
+        "Print the maximum number of bookings that can be accepted.",
+        "1 ≤ n ≤ 100000; 0 ≤ s < e ≤ 10⁹.",
+    ),
+    "DEMO-021": english_statement(
+        "Alternate-Day Collection",
+        "Each of n consecutive days has an integer return. Choose any days to collect, but "
+        "never choose two adjacent days. Choosing no day is allowed and gives a return of "
+        "zero. Find the maximum total return.",
+        "The first line contains n. The second line contains n integer returns in date order.",
+        "Print the maximum total return.",
+        "1 ≤ n ≤ 100000; each return is between −10⁹ and 10⁹.",
+    ),
+    "DEMO-022": english_statement(
+        "Token Exchange",
+        "There are n distinct positive integer token denominations, with unlimited tokens "
+        "of each. Make the amount a exactly while using as few tokens as possible. Print "
+        "-1 if it is impossible; amount zero needs no tokens.",
+        "The first line contains n and a. The second line contains n distinct positive "
+        "denominations.",
+        "Print the minimum token count, or -1.",
+        "1 ≤ n ≤ 20; 0 ≤ a ≤ 10000; 1 ≤ denomination ≤ 100.",
+    ),
+    "DEMO-023": english_statement(
+        "Camp Network",
+        "There are undirected roads among n camps. Camps belong to the same communication "
+        "region when one can reach the other using one or more roads. An isolated camp "
+        "forms its own region. Find the number of regions.",
+        "The first line contains n and m. Each of the next m lines contains an undirected "
+        "road u v.",
+        "Print the number of connected components in the undirected graph.",
+        "1 ≤ n ≤ 100000; 0 ≤ m ≤ 200000; 1 ≤ u, v ≤ n. Duplicate edges and self-loops "
+        "are allowed.",
+    ),
+    "DEMO-024": english_statement(
+        "Grid Mail Delivery",
+        "A map is an n by m grid. A dot . is passable and # is blocked. Move from the "
+        "top-left cell to the bottom-right cell, one cell up, down, left, or right at a "
+        "time, without leaving the grid or entering an obstacle. Find the fewest steps. "
+        "Print -1 if either endpoint is blocked or the destination is unreachable.",
+        "The first line contains n and m. Each of the next n lines contains m characters, "
+        "only . and #, with no spaces.",
+        "Print the minimum number of moves, or -1 if unreachable. Print 0 when the start "
+        "and destination are the same passable cell.",
+        "1 ≤ n, m ≤ 500.",
+    ),
+}
+
+for _problem in DEMO_PROBLEMS:
+    _problem["translations"] = {"en": DEMO_ENGLISH[_problem["id"]]}
+del _problem
+
+
 # These are original reference programs, not hidden tests or imported solutions.
 SEED_SOLUTIONS = {
     "DEMO-001": "a, b = map(int, input().split())\nprint(a + b)\n",

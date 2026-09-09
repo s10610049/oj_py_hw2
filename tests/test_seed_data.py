@@ -12,6 +12,7 @@ import pytest
 
 from oj.judge import judge_submission
 from oj.schemas import validate_problem
+from oj.translations import embedded_english_translation
 from scripts.seed_data import DEMO_PROBLEMS, SEED_SOLUTIONS
 from scripts.seed_demo import seed_problems
 
@@ -78,7 +79,9 @@ def test_catalog_identity_and_topic_coverage():
 
 @pytest.mark.parametrize("problem", DEMO_PROBLEMS, ids=lambda problem: problem["id"])
 def test_every_problem_meets_schema_samples_and_provenance(problem):
-    assert validate_problem(problem) == problem
+    core_problem = {key: value for key, value in problem.items() if key != "translations"}
+    assert validate_problem(problem) == core_problem
+    assert embedded_english_translation(problem) == problem["translations"]["en"]
     assert len(problem["samples"]) >= 2
     assert len(problem["testcases"]) >= 8
     assert len({case["input"] for case in problem["testcases"]}) >= 8
