@@ -400,6 +400,24 @@ def test_auth_network_error_redacts_and_clears_secret_without_losing_step(regist
     assert "_user" not in at.session_state
 
 
+@pytest.mark.parametrize(
+    "api_message,expected",
+    [
+        ("Account is banned", "账户已被禁用，请联系管理员。"),
+        ("Another permission failure", "Another permission failure"),
+    ],
+)
+def test_login_ban_translation_preserves_other_permission_errors(api_message, expected):
+    fake = FakeAPI()
+    fake.failure = ("POST", "/api/auth/login", 403, api_message)
+    at = auth_password_step(app(fake, logged_in=False))
+    at.text_input(key="login_password").set_value("temporary-secret")
+    at.button(key="auth_continue").click().run()
+    assert not at.exception and at.error[0].value == expected
+    assert at.text_input(key="login_password").value == ""
+    assert "_user" not in at.session_state
+
+
 def test_auth_styles_are_scoped_reduced_motion_and_keyboard_safe():
     from frontend.styles import CSS
 
@@ -639,6 +657,62 @@ def test_narrow_auth_hides_story_layout_wrapper_and_expands_only_form_wrapper():
     assert "display:none" not in form_rule
     assert narrow.count("display:none") == 1
     assert ".st-key-workspace_shell" not in narrow
+
+
+def test_catalog_open_button_keeps_readable_action_column_and_native_label():
+    at = app(FakeAPI())
+    assert not at.exception
+    action = next(
+        column
+        for column in at.get("column")
+        if any(item.key == "open_sum" for item in column.button)
+    )
+    # 1024px with sidebar leaves too little room at the former 1/9 share.
+    # Reserve 1/6 of the row; native Streamlit columns still stack on mobile.
+    assert action.weight == pytest.approx(1 / 6)
+    assert action.button(key="open_sum").label == "打开"
+    action.button(key="open_sum").click().run()
+    assert not at.exception and at.title[0].value == PROBLEM["title"]
+
+
+@pytest.mark.parametrize("mode", ["detail", "edit"])
+def test_deleted_selected_problem_can_return_to_catalog_and_clear_stale_selection(mode):
+    fake = FakeAPI()
+    at = app(fake, _problem_mode=mode, _problem_id="sum")
+    assert not at.exception
+    fake.failure = ("GET", "/api/problems/sum", 404, "Problem not found")
+    fake.problems = [{**deepcopy(PROBLEM), "id": "remaining", "title": "另一道题"}]
+    at.run()
+    assert not at.exception and at.error
+    assert button(at, "← 返回题库")
+    # Switching away must not remove the recovery path when the stale request
+    # fails again; this reproduces the independent review's sidebar sequence.
+    at.button(key="nav_account").click().run()
+    at.button(key="nav_problems").click().run()
+    assert not at.exception and at.error
+    button(at, "← 返回题库").click().run()
+    assert not at.exception and not at.error
+    assert at.session_state["_problem_mode"] == "list"
+    assert at.session_state["_problem_id"] is None
+    assert any(call[:2] == ("GET", "/api/problems/") for call in fake.calls)
+    at.button(key="open_remaining").click().run()
+    assert not at.exception and at.title[0].value == "另一道题"
+
+
+@pytest.mark.parametrize("status", [0, 403, 500])
+def test_problem_load_errors_remain_visible_and_recoverable_without_fake_success(status):
+    fake = FakeAPI()
+    fake.failure = ("GET", "/api/problems/sum", status, "Synthetic load failure")
+    at = app(fake, _problem_mode="detail", _problem_id="sum")
+    assert not at.exception and at.error
+    assert not at.success and not at.tabs
+    assert at.session_state["_problem_mode"] == "detail"
+    assert at.session_state["_problem_id"] == "sum"
+    assert button(at, "重新加载")
+    button(at, "← 返回题库").click().run()
+    assert not at.exception and not at.error
+    assert at.session_state["_problem_mode"] == "list"
+    assert at.session_state["_problem_id"] is None
 
 
 def test_user_can_edit_but_cannot_delete():

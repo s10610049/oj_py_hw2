@@ -89,6 +89,8 @@ def _auth_submit():
                 message = message.replace(secret, "[已隐藏]")
         if mode == "login" and exc.status == 401:
             message = "用户名或密码不正确，请重试。"
+        elif mode == "login" and exc.status == 403 and exc.message == "Account is banned":
+            message = "账户已被禁用，请联系管理员。"
         elif exc.status == 0:
             message = f"连接暂不可用，请稍后重试。{message}"
         st.session_state["_auth_error"] = message

@@ -42,7 +42,7 @@ def catalog():
     st.session_state["catalog_page"] = min(st.session_state.get("catalog_page", 1), pages)
     page = st.number_input("题库页码", min_value=1, max_value=pages, step=1, key="catalog_page")
     for problem in filtered[(page - 1) * 12 : page * 12]:
-        title, meta, action = st.columns([6, 2, 1])
+        title, meta, action = st.columns([6, 1.5, 1.5])
         title.write(problem["title"])
         title.caption(
             problem["id"]
@@ -115,7 +115,6 @@ def code_submission(problem):
 
 
 def problem_detail(problem):
-    st.button("← 返回题库", on_click=go, args=("题库",), kwargs={"_problem_mode": "list"})
     st.title(problem["title"])
     time_limit = (
         f"{problem['time_limit']} 秒" if problem.get("time_limit") is not None else "随语言配置"
@@ -165,13 +164,20 @@ def problems_page():
     if mode == "list":
         catalog()
         return
+    # Keep recovery available before fetching a selected problem: another
+    # session may have deleted it. Returning also discards the stale identity.
+    st.button(
+        "← 返回题库",
+        on_click=go,
+        args=("题库",),
+        kwargs={"_problem_mode": "list", "_problem_id": None},
+    )
     problem = None
     if mode in ("detail", "edit"):
         problem = api().request("GET", f"/api/problems/{resource(st.session_state['_problem_id'])}")
     if mode == "detail":
         problem_detail(problem)
         return
-    st.button("← 返回题库", on_click=go, args=("题库",), kwargs={"_problem_mode": "list"})
     st.title("编辑题目" if problem else "新增题目")
     st.caption("完整填写题面与测试数据。保存后仍可继续编辑。")
     payload = problem_form(
