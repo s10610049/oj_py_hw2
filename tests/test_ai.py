@@ -184,6 +184,28 @@ async def test_config_controls_request_and_isolated_snapshot(services, config, p
 
 
 @pytest.mark.asyncio
+async def test_generated_complete_english_statement_is_preserved(services, config, problem):
+    bilingual = copy.deepcopy(problem)
+    bilingual["translations"] = {
+        "en": {
+            "title": "Integer Sum",
+            "description": "Compute the sum of two integers.",
+            "input_description": "Read two integers a and b.",
+            "output_description": "Print a + b.",
+            "constraints": "Both integers are between -100 and 100.",
+            "hint": "Use integer addition.",
+        }
+    }
+    service = services(config, lambda _: response(stream_bytes(bilingual)))
+
+    final = await finished(service, await service.start("alice", "生成双语整数求和题"))
+
+    assert final["status"] == "completed"
+    assert final["result"]["translations"]["en"]["title"] == "Integer Sum"
+    assert all(case in final["result"]["testcases"] for case in problem["testcases"])
+
+
+@pytest.mark.asyncio
 async def test_config_empty_key_retained_only_for_same_provider(services, config):
     service = services(config, lambda _: response(b""))
     public = await service.configure("alice", {**config, "api_key": ""})

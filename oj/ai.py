@@ -21,6 +21,7 @@ from oj.common import APIError
 from oj.authoring_checks import check_generated
 from oj.pricing import resolve_pricing
 from oj.schemas import text_field, validate_problem
+from oj.translations import embedded_english_translation
 
 TASK_TIMEOUT_SECONDS = 230.0
 MAX_STREAM_BYTES = 16_000_000  # SSE metadata repeats per token; distinct from generated content.
@@ -61,6 +62,8 @@ input_description，output_description，constraints，samples，testcases。
 samples/testcases 都是非空数组，每项必须有字符串 input/output，换行必须为合法 JSON 转义。
 还须给出 hint、source（写AI生成，不伪造引用）、tags（字符串数组）、time_limit（正数，秒）、
 memory_limit（正整数，MB）、author、difficulty。题目、约束、样例和测例答案必须互相一致。
+同时在 translations.en 中给出完整英文 title、description、input_description、
+output_description、constraints、hint；只翻译公开题面文字，不改代码、样例、测试点和限制数值。
 
 题面要明确输入数量、范围、特殊情况和输出含义，样例至少2个；最终测试点建议10—16个，
 覆盖最小/最大合法边界、典型路径、重复或相等、零/负数（仅在合法时）、易错和退化情况。
@@ -645,7 +648,8 @@ class AIService:
             targeted = (
                 "上一稿字段合同不完整或类型错误。逐项补齐id、题面、输入输出说明、约束、"
                 "samples、testcases、time_limit、memory_limit、reference_solution、"
-                "validation_notes，并确保数组元素和字符串类型符合系统提示。"
+                "validation_notes及translations.en完整六项题面翻译，并确保数组元素和字符串"
+                "类型符合系统提示。"
             )
         elif category.startswith("generator") or category in {
             "combined_output_size",
@@ -797,6 +801,9 @@ class AIService:
             raise _RepairableCandidate("authoring_check:problem_json") from None
         try:
             result = validate_problem(value)
+            translation = embedded_english_translation(value)
+            if translation is not None:
+                result["translations"] = {"en": translation}
             for name in (
                 "reference_solution",
                 "test_generator",
