@@ -20,8 +20,10 @@ from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
 
 from oj.common import APIError, response
+from oj.progress import build_progress_payloads, problem_version_digest
 from oj.schemas import identifier, paginate, pagination, text_field, validate_problem
 from oj.store import Store
+from shared.taxonomy import normalize_difficulty
 
 COOKIE = "oj_session"
 SESSION_SECONDS = 24 * 3600
@@ -355,6 +357,31 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             ]
         )
 
+    async def personal_progress(user):
+        snapshot = await store.snapshot("problems", "submissions")
+        try:
+            return build_progress_payloads(
+                snapshot["problems"],
+                snapshot["submissions"],
+                user["user_id"],
+                difficulty_normalizer=normalize_difficulty,
+                generated_at=now(),
+            )
+        except (TypeError, ValueError, KeyError, OverflowError):
+            # Corrupt timestamps or aggregates must fail atomically and must not
+            # expose raw stored documents, code or hidden cases.
+            raise APIError(500, "Learning progress could not be calculated") from None
+
+    @application.get("/api/me/problem-statuses/")
+    async def personal_problem_statuses(user=Depends(current_user)):
+        statuses, _ = await personal_progress(user)
+        return response(statuses)
+
+    @application.get("/api/me/learning-stats/")
+    async def personal_learning_stats(user=Depends(current_user)):
+        _, statistics = await personal_progress(user)
+        return response(statistics)
+
     @application.post("/api/problems/")
     async def add_problem(request: Request, user=Depends(current_user)):
         problem = validate_problem(await body_object(request))
@@ -494,6 +521,10 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
                 "run_info": None,
                 "error_info": None,
                 "details": [],
+                "problem_version": problem_version_digest(problem),
+                "problem_title": problem["title"],
+                "difficulty_raw": problem.get("difficulty", ""),
+                "tags_snapshot": list(problem.get("tags") or []),
             }
             await store.put("submissions", submission["submission_id"], submission)
             recent_submissions[user["user_id"]] = history + [stamp]
@@ -565,6 +596,11 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
                 run_info=None,
                 error_info=None,
                 revision=record["revision"] + 1,
+                problem_version=problem_version_digest(problem),
+                problem_title=problem["title"],
+                difficulty_raw=problem.get("difficulty", ""),
+                tags_snapshot=list(problem.get("tags") or []),
+                version_inferred=False,
             )
             await store.put("submissions", submission_id, record)
             launch(record, problem, language)
