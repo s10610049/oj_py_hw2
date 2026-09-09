@@ -2,9 +2,21 @@
 
 程序设计训练（Python）OJ 课程项目，使用 FastAPI 异步后端与 Streamlit 前端。
 
-当前阶段已提供开发环境、严格题目校验和异步 AI 命题服务内核。HTTP 业务入口、判题与界面在后续独立阶段集成；尚不将内核测试视为整站验收。
+当前阶段已实现题目、用户与权限、提交、Python/C++判题、日志以及AI命题接口。Streamlit页面在下一阶段集成；尚不将模块测试视为整站验收。
 
 AI 内核位于 `oj/ai.py`：可配置模型、流式进度、230 秒总超时、真实中断、Token/费用、结果结构校验。配置从调用方传入，测试使用合成凭据和受控 HTTP 响应，不需要真实 API Key。价格缺失时费用为 `null`；估算会明确标注，不冒充提供商账单。
+
+## 运行后端
+
+```sh
+uv run --locked python -m uvicorn oj.main:app --host 127.0.0.1 --port 8000
+```
+
+接口说明：`http://127.0.0.1:8000/docs`；初始管理员为课程指定的 `admin / admintestpassword`。默认数据存储于已忽略的 `runtime/oj.sqlite3`，可用 `OJ_DATABASE` 指定其他文件。API全为异步；数据库与bcrypt操作在线程中执行，判题和模型在可取消后台任务中运行。
+
+这是本地课程系统，**不要直接暴露到公网**。进程资源限制与清理不是生产级恶意代码沙箱；提交代码仍以服务账户权限执行，应仅运行可信课堂代码，并在隔离、无秘密的Linux环境进行评测。Windows应用程序控制可能拒绝新编译C++程序（4551），此时明确返回基础设施错误，不篡改为通过。
+
+AI接口：`GET/PUT /api/ai/model-config` 配置provider_url/model/api_key及可选input_price/output_price/price_unit/currency；`POST /api/ai/problem-tasks/` 接受requirement和可选problem_id；`GET /api/ai/problem-tasks/{id}` 查询status/progress/result/usage；`PUT /api/ai/problem-tasks/{id}/cancel` 实际终止未结束任务。任务状态为pending/running/completed/cancelled/failed；创建者或管理员可查/取消，终态取消返回409。模型配置仅留在服务内存，重启后回到本地环境配置，响应永不返回密钥；切换提供商必须重新输入密钥。
 
 ## 开发环境
 
