@@ -662,7 +662,7 @@ def breakdown_html(stats: Mapping[str, Any], kind: str, locale: str = "zh-CN") -
     else:
         body = "".join(
             "<div class='oj-bar-row' "
-            f"aria-label='{html.escape(row['label'] + ", " + row['meta'], quote=True)}'>"
+            f"aria-label='{html.escape(row['label'] + ', ' + row['meta'], quote=True)}'>"
             "<div class='oj-bar-meta'>"
             f"<span class='oj-difficulty-token {row['token']}'>{html.escape(row['label'])}</span>"
             f"<span>{html.escape(row['meta'])}</span></div>"
