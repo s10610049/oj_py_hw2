@@ -31,9 +31,18 @@ class APIClient:
             transport=transport,
         )
 
-    def request(self, method, path, *, json=None, params=None):
+    def request(self, method, path, *, json=None, content=None, headers=None, params=None):
+        if json is not None and content is not None:
+            raise ValueError("json and content are mutually exclusive")
         try:
-            response = self.http.request(method, path, json=json, params=params)
+            response = self.http.request(
+                method,
+                path,
+                json=json,
+                content=content,
+                headers=headers,
+                params=params,
+            )
         except httpx.TimeoutException:
             raise APIError(0, "请求超时。请重试查询；写入请求可能已处理，请先核对结果。") from None
         except httpx.HTTPError:
