@@ -25,6 +25,18 @@ async def test_generated_case_cannot_publish_configured_key(tmp_path, generated_
         "testcases": [{"input": "0", "output": "ok"}],
         "reference_solution": 'print("ok")',
         "test_generator": 'import json\nprint(json.dumps(["1"]))',
+        "validation_notes": "Synthetic security-boundary fixture.",
+        "test_generation_notes": "One deterministic synthetic generated input.",
+        "translations": {
+            "en": {
+                "title": "Synthetic fixture",
+                "description": "Offline final-result boundary regression.",
+                "input_description": "Read an integer or a synthetic string.",
+                "output_description": "Print a synthetic string.",
+                "constraints": "Only synthetic audit data is used.",
+                "hint": "Validate the final generated cases before publication.",
+            }
+        },
     }
     if generated_field == "input":
         problem["test_generator"] = (

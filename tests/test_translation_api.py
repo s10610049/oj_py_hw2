@@ -63,7 +63,8 @@ async def test_problem_locale_projection_translation_update_and_staleness(tmp_pa
 
             fallback = checked(await client.get("/api/problems/BILINGUAL", params={"locale": "en"}))
             assert fallback["content"]["status"] == "missing"
-            assert fallback["content"]["resolved_locale"] == "zh-CN"
+            assert fallback["content"]["resolved_locale"] is None
+            assert not any(fallback["content"]["fields"].values())
             assert "SECRET_INPUT" not in str(fallback["content"])
 
             ready = checked(
@@ -78,7 +79,8 @@ async def test_problem_locale_projection_translation_update_and_staleness(tmp_pa
             checked(await client.put("/api/problems/BILINGUAL", json=changed))
             stale = checked(await client.get("/api/problems/BILINGUAL", params={"locale": "en"}))
             assert stale["content"]["status"] == "stale"
-            assert stale["content"]["fields"]["description"] == "新的中文题意。"
+            assert stale["content"]["resolved_locale"] is None
+            assert not any(stale["content"]["fields"].values())
 
             checked(await client.delete("/api/problems/BILINGUAL/translations/en"))
             assert (

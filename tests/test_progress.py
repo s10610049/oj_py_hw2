@@ -7,6 +7,9 @@ import math
 import pytest
 
 from oj.progress import (
+    CHAT_CONTEXT_MAX_PROBLEMS,
+    CHAT_CONTEXT_MAX_RECENT_ACTIVITY,
+    CHAT_CONTEXT_SCHEMA,
     PROBLEM_VERSION_FIELDS,
     build_learning_stats,
     build_problem_statuses,
@@ -56,12 +59,14 @@ def make_submission(
     day=9,
     user_id=USER,
     inferred=False,
+    language="python",
 ):
     return {
         "submission_id": key,
         "user_id": user_id,
         "problem_id": problem_id,
         "problem_version": version,
+        "language": language,
         "version_inferred": inferred,
         "status": status,
         "score": score,
@@ -202,6 +207,7 @@ def test_stats_kpis_scope_outcomes_and_timeline_are_hand_calculated():
         "difficulty",
         "knowledge_points",
         "problems",
+        "chat_context",
     }
     assert stats["schema_version"] == "oj.learning-stats.v1"
     assert stats["scope"] == {
@@ -219,6 +225,10 @@ def test_stats_kpis_scope_outcomes_and_timeline_are_hand_calculated():
         "passed_count": 1,
         "pass_rate": 0.25,
     }
+    # The chat-specific rate excludes a problem whose only current submission
+    # is still pending, without changing the established analytics v1 KPI.
+    assert stats["chat_context"]["summary"]["attempted_problem_count"] == 3
+    assert stats["chat_context"]["summary"]["pass_rate"] == pytest.approx(1 / 3)
     assert stats["submission_outcomes"] == [
         {"id": "pending", "count": 2},
         {"id": "judge_error", "count": 1},
@@ -288,6 +298,202 @@ def test_difficulty_knowledge_points_and_problem_rows_are_reconcilable():
     assert problems["p1"]["available_score"] == 30
     assert problems["p1"]["difficulty_id"] == "luogu-5"
     assert problems["p1"]["tags"] == ["Graph", "环检测"]
+
+
+def test_chat_context_v3_counts_every_own_submission_and_only_safe_fields():
+    problem = make_problem("chat", 1, "easy", ["Loops", "循环"], public_cases=True)
+    version = problem_version_digest(problem)
+    rows = []
+    cases = [
+        ("pending", None, None, "AC", "python"),
+        ("success", 10, 10, "AC", "cpp"),
+        ("success", 0, 10, "WA", "python"),
+        ("success", 0, 10, "CE", "cpp"),
+        ("success", 0, 10, "TLE", "python"),
+        ("success", 0, 10, "MLE", "cpp"),
+        ("success", 0, 10, "RE", "python"),
+        ("success", 0, 10, "UNK", "cpp"),
+        ("success", 5, 10, None, "python"),
+    ]
+    for minute, (status, score, counts, verdict, language) in enumerate(cases):
+        row = make_submission(
+            f"chat-{minute}",
+            problem["id"],
+            version,
+            status,
+            score,
+            counts,
+            minute,
+            language=language,
+        )
+        row["details"] = (
+            [] if verdict is None else [{"result": verdict, "private": f"PRIVATE_DETAIL_{minute}"}]
+        )
+        rows.append(row)
+    rows.append(
+        make_submission(
+            "other-user-row",
+            problem["id"],
+            version,
+            "success",
+            10,
+            10,
+            10,
+            user_id="other-user",
+            language="secret-language",
+        )
+    )
+
+    first = build_progress_snapshot(
+        [problem],
+        rows,
+        USER,
+        generated_at=STAMP,
+        difficulty_normalizer=normalize_difficulty,
+    )
+    second = build_progress_snapshot(
+        [problem],
+        list(reversed(rows)),
+        USER,
+        generated_at=STAMP,
+        difficulty_normalizer=normalize_difficulty,
+    )
+    context = first["stats"]["chat_context"]
+    assert context == second["stats"]["chat_context"]
+    assert set(context) == {
+        "schema_version",
+        "context_epoch",
+        "generated_at",
+        "coverage",
+        "summary",
+        "per_problem",
+        "recent_activity",
+        "aggregates",
+    }
+    assert context["schema_version"] == CHAT_CONTEXT_SCHEMA
+    assert len(context["recent_activity"]) == len(cases)
+    assert context["recent_activity"][0]["submission_id"] == "chat-8"
+    assert set(context["recent_activity"][0]) == {
+        "submission_id",
+        "problem_id",
+        "status",
+        "outcome",
+        "score",
+        "counts",
+        "language",
+        "relation",
+        "created_at",
+    }
+    assert "PRIVATE" not in json.dumps(context["recent_activity"])
+    assert context["summary"]["submission_count"] == 9
+    assert context["summary"]["content_projection"] == "source"
+    assert context["per_problem"][0] == {
+        "problem_id": "chat",
+        "title": "Problem chat",
+        "difficulty_id": "luogu-1",
+        "knowledge_points": ["Loops", "循环"],
+        "state": "passed",
+        "latest_outcome": "partial",
+        "best_score": 10,
+        "available_score": 10,
+        "attempt_count": 9,
+        "last_submitted_at": "2026-09-09T10:08:00Z",
+    }
+    outcomes = {row["id"]: row["count"] for row in context["aggregates"]["outcome"]}
+    assert outcomes == {
+        "pending": 1,
+        "accepted": 1,
+        "wrong_answer": 1,
+        "zero_score": 0,
+        "partial": 1,
+        "compile_error": 1,
+        "time_limit": 1,
+        "memory_limit": 1,
+        "runtime_error": 1,
+        "judge_error": 1,
+    }
+    assert context["aggregates"]["language"] == [
+        {"id": "python", "count": 5},
+        {"id": "cpp", "count": 4},
+    ]
+    assert (
+        sum(outcomes.values())
+        == sum(row["count"] for row in context["aggregates"]["language"])
+        == context["summary"]["submission_count"]
+    )
+    encoded = json.dumps(context, ensure_ascii=False)
+    for forbidden in (
+        USER,
+        "other-user",
+        "secret-language",
+        "SECRET_SOURCE_CODE",
+        "SECRET_HIDDEN_INPUT",
+        "PRIVATE_DETAIL_",
+        "SECRET_CASE_",
+        "SECRET_REFERENCE",
+    ):
+        assert forbidden not in encoded
+
+
+def test_chat_context_problem_details_have_deterministic_count_bound():
+    problems = [make_problem(f"p{index:04d}", 1) for index in range(520)]
+    forward = build_learning_stats(problems, [], USER, generated_at=STAMP)["chat_context"]
+    reverse = build_learning_stats(list(reversed(problems)), [], USER, generated_at=STAMP)[
+        "chat_context"
+    ]
+
+    assert forward == reverse
+    assert len(forward["per_problem"]) == CHAT_CONTEXT_MAX_PROBLEMS
+    assert forward["summary"]["catalog_problem_count"] == 520
+    assert forward["summary"]["included_problem_count"] == CHAT_CONTEXT_MAX_PROBLEMS
+    assert "problem_details_truncated" in forward["coverage"]["omissions"]
+    assert forward["coverage"]["status"] == "partial"
+
+
+def test_chat_context_recent_activity_is_latest_first_and_bounded():
+    problem = make_problem("recent", 1, public_cases=True)
+    version = problem_version_digest(problem)
+    submissions = [
+        make_submission(
+            f"recent-{minute:02d}",
+            problem["id"],
+            version,
+            "success",
+            10,
+            10,
+            minute,
+            language="python",
+        )
+        for minute in range(CHAT_CONTEXT_MAX_RECENT_ACTIVITY + 3)
+    ]
+    context = build_learning_stats([problem], submissions, USER, generated_at=STAMP)["chat_context"]
+
+    assert len(context["recent_activity"]) == CHAT_CONTEXT_MAX_RECENT_ACTIVITY
+    assert context["recent_activity"][0]["submission_id"] == (
+        f"recent-{CHAT_CONTEXT_MAX_RECENT_ACTIVITY + 2:02d}"
+    )
+    assert context["summary"]["total_recent_activity_count"] == len(submissions)
+    assert context["summary"]["included_recent_activity_count"] == (
+        CHAT_CONTEXT_MAX_RECENT_ACTIVITY
+    )
+    assert "recent_activity_truncated" in context["coverage"]["omissions"]
+
+
+def test_chat_context_marks_legacy_submission_language_as_unknown():
+    problem = make_problem("legacy-language", 1)
+    row = make_submission(
+        "legacy-language-row",
+        problem["id"],
+        problem_version_digest(problem),
+        "success",
+        10,
+        10,
+        1,
+    )
+    row.pop("language")
+    context = build_learning_stats([problem], [row], USER, generated_at=STAMP)["chat_context"]
+    assert context["aggregates"]["language"] == [{"id": "__unknown__", "count": 1}]
+    assert "submission_language_unknown" in context["coverage"]["omissions"]
 
 
 def test_best_order_is_ratio_score_time_then_identifier():
@@ -364,7 +570,7 @@ def test_outdated_pending_submission_does_not_overlay_the_current_problem():
     ],
 )
 def test_latest_outcome_is_an_allow_listed_privacy_safe_verdict(judge_code, expected):
-    problem = make_problem("verdict", 1)
+    problem = make_problem("verdict", 1, public_cases=True)
     submission = make_submission(
         "verdict-row",
         problem["id"],
@@ -401,6 +607,46 @@ def test_latest_outcome_is_an_allow_listed_privacy_safe_verdict(judge_code, expe
         "version_unknown",
     }
     assert "private" not in json.dumps(result)
+
+
+def test_private_judge_details_never_reach_status_or_chat_outcome():
+    problem = make_problem("private-verdict", 1, public_cases=False)
+    submission = make_submission(
+        "private-row",
+        problem["id"],
+        problem_version_digest(problem),
+        "success",
+        0,
+        10,
+        1,
+    )
+    submission["details"] = [{"result": "CE", "log": "PRIVATE_COMPILER_LOG"}]
+
+    result = build_progress_snapshot([problem], [submission], USER, generated_at=STAMP)
+    status = result["statuses"]["items"][0]
+    context = result["stats"]["chat_context"]
+    outcomes = {row["id"]: row["count"] for row in context["aggregates"]["outcome"]}
+
+    assert status["latest_outcome"] == "judge_error"
+    assert context["per_problem"][0]["latest_outcome"] == "zero_score"
+    assert outcomes["zero_score"] == 1 and outcomes["compile_error"] == 0
+    assert outcomes["judge_error"] == 0
+    assert "PRIVATE_COMPILER_LOG" not in json.dumps(result)
+
+
+def test_chat_context_epoch_changes_when_judge_log_visibility_changes():
+    private = make_problem("visibility", 1, public_cases=False)
+    public = {**private, "public_cases": True}
+    version = problem_version_digest(private)
+    submission = make_submission("visibility-row", private["id"], version, "success", 0, 10, 1)
+    submission["details"] = [{"result": "WA"}]
+
+    hidden = build_progress_snapshot([private], [submission], USER, generated_at=STAMP)
+    visible = build_progress_snapshot([public], [submission], USER, generated_at=STAMP)
+
+    assert hidden["statuses"]["context_epoch"] != visible["statuses"]["context_epoch"]
+    assert hidden["stats"]["chat_context"]["per_problem"][0]["latest_outcome"] == "zero_score"
+    assert visible["stats"]["chat_context"]["per_problem"][0]["latest_outcome"] == "wrong_answer"
 
 
 def test_passed_state_survives_pending_overlay_and_reports_pending_activity():
@@ -462,6 +708,42 @@ def test_epoch_is_shared_deterministic_and_secret_safe():
     changed = snapshot(problems, changed_runtime, generated_at="2099-01-01T00:00:00+00:00")
     assert changed["statuses"]["context_epoch"] == statuses["context_epoch"]
 
+    changed_language = [
+        (
+            {**submission, "language": "cpp"}
+            if submission["submission_id"] == "s-partial"
+            else submission
+        )
+        for submission in submissions
+    ]
+    assert (
+        snapshot(problems, changed_language)["statuses"]["context_epoch"]
+        != statuses["context_epoch"]
+    )
+
+    changed_hidden_outcome = [
+        (
+            {**submission, "details": [{"result": "CE", "private": "still-private"}]}
+            if submission["submission_id"] == "s-later-wa"
+            else submission
+        )
+        for submission in submissions
+    ]
+    assert (
+        snapshot(problems, changed_hidden_outcome)["statuses"]["context_epoch"]
+        == statuses["context_epoch"]
+    )
+
+    public_problems = [
+        {**problem, "public_cases": True} if problem["id"] == "p1" else problem
+        for problem in problems
+    ]
+    public_baseline = snapshot(public_problems, submissions)
+    assert (
+        snapshot(public_problems, changed_hidden_outcome)["statuses"]["context_epoch"]
+        != public_baseline["statuses"]["context_epoch"]
+    )
+
     reordered = snapshot(list(reversed(problems)), list(reversed(submissions)))
     assert reordered["statuses"]["context_epoch"] == statuses["context_epoch"]
     assert reordered["stats"]["timeline"] == stats["timeline"]
@@ -503,7 +785,7 @@ def test_malformed_submission_fails_atomically(change, match):
         build_progress_snapshot([problem], [{**row, **change}], USER, generated_at=STAMP)
 
 
-def test_default_difficulty_is_neutral_and_does_not_infer_medium():
+def test_default_difficulty_stays_neutral_without_a_supplied_normalizer():
     problem = make_problem("custom", 1, "medium")
     result = build_learning_stats([problem], [], USER, generated_at=STAMP)
     assert result["difficulty"] == [
@@ -515,6 +797,19 @@ def test_default_difficulty_is_neutral_and_does_not_infer_medium():
             "earned_score": 0,
             "available_score": 10,
             "rate": None,
+        }
+    ]
+    second = make_problem("another-custom", 2, "custom")
+    chat_difficulty = build_learning_stats([problem, second], [], USER, generated_at=STAMP)[
+        "chat_context"
+    ]["aggregates"]["difficulty"]
+    assert chat_difficulty == [
+        {
+            "id": None,
+            "attempted": 0,
+            "passed": 0,
+            "earned_score": 0,
+            "available_score": 30,
         }
     ]
 

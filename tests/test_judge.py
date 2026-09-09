@@ -133,6 +133,22 @@ async def test_python_real_verdicts(code, expected, verdict):
 
 
 @pytest.mark.asyncio
+async def test_python_syntax_error_hides_runner_and_submission_absolute_paths():
+    result = await judge_submission(problem(expected=""), PYTHON, "def invalid(:")
+
+    assert_verdict(result, "RE")
+    message = result["run_info"]["message"]
+    project_root = Path(__file__).resolve().parents[1]
+    runner = project_root / "oj" / "python_runner.py"
+    for private_path in (project_root, runner):
+        assert str(private_path) not in message
+        assert private_path.as_posix() not in message
+    assert '[runner]/python_runner.py", line' in message
+    assert '[submission]/main.py", line 1' in message
+    assert "SyntaxError: invalid syntax" in message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "code",
     [

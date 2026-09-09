@@ -11,17 +11,44 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
 PROBLEM_STATUS_SCHEMA = "oj.problem-status.v1"
 LEARNING_STATS_SCHEMA = "oj.learning-stats.v1"
+ADMIN_LEARNING_OVERVIEW_SCHEMA = "oj.admin-learning-overview.v1"
+CHAT_CONTEXT_SCHEMA = "oj.chat-context.v4"
 OUTCOME_IDS = ("pending", "judge_error", "zero_score", "partial", "full")
+ADMIN_OUTCOME_IDS = (
+    "pending",
+    "accepted",
+    "partial",
+    "wrong_answer",
+    "compile_error",
+    "time_limit",
+    "memory_limit",
+    "runtime_error",
+    "judge_error",
+)
+CHAT_OUTCOME_IDS = (
+    "pending",
+    "accepted",
+    "wrong_answer",
+    "zero_score",
+    "partial",
+    "compile_error",
+    "time_limit",
+    "memory_limit",
+    "runtime_error",
+    "judge_error",
+)
 VERDICT_IDS = {
     "pending",
     "accepted",
     "wrong_answer",
+    "zero_score",
     "partial",
     "compile_error",
     "time_limit",
@@ -37,6 +64,33 @@ _JUDGE_VERDICTS = {
     "WA": "wrong_answer",
     "UNK": "judge_error",
 }
+
+CHAT_CONTEXT_MAX_PROBLEMS = 512
+CHAT_CONTEXT_MAX_DIFFICULTIES = 64
+CHAT_CONTEXT_MAX_KNOWLEDGE = 256
+CHAT_CONTEXT_MAX_LANGUAGES = 64
+CHAT_CONTEXT_MAX_PROBLEM_KNOWLEDGE = 30
+CHAT_CONTEXT_MAX_RECENT_ACTIVITY = 20
+CHAT_CONTEXT_MAX_TITLE_BYTES = 1000
+CHAT_CONTEXT_MAX_KNOWLEDGE_BYTES = 240
+UNKNOWN_LANGUAGE_ID = "__unknown__"
+OTHER_LANGUAGE_ID = "__other__"
+CHAT_CONTEXT_OMISSIONS = (
+    "orphan_problem_metadata",
+    "submission_version_unknown",
+    "outdated_submission_version",
+    "pending_submission_results",
+    "submission_language_unknown",
+    "problem_titles_truncated",
+    "problem_knowledge_truncated",
+    "problem_details_truncated",
+    "recent_activity_truncated",
+    "difficulty_aggregates_truncated",
+    "knowledge_aggregates_truncated",
+    "language_aggregates_truncated",
+    "english_problem_translation_missing",
+    "english_knowledge_translation_missing",
+)
 
 PROBLEM_VERSION_FIELDS = (
     "id",
@@ -180,6 +234,117 @@ def build_progress_payloads(
     return snapshot["statuses"], snapshot["stats"]
 
 
+def build_admin_learning_overview(
+    users: Iterable[Mapping[str, Any]],
+    problems: Iterable[Mapping[str, Any]],
+    submissions: Iterable[Mapping[str, Any]],
+    *,
+    difficulty_normalizer: DifficultyNormalizer | None = None,
+    generated_at: str | None = None,
+) -> dict[str, Any]:
+    """Return an administrator-only, privacy-safe account comparison.
+
+    The projection deliberately reuses the personal progress calculation for
+    every account so individual and cohort metrics cannot drift.  Only account
+    identity, role and aggregate learning values cross the API boundary; raw
+    submissions, source code and judge details are never returned.
+    """
+
+    if generated_at is None or not str(generated_at).strip():
+        raise ValueError("generated_at must be supplied")
+    problem_records = list(problems)
+    submission_records = list(submissions)
+    prepared_users = []
+    seen_user_ids = set()
+    for raw in users:
+        if not isinstance(raw, Mapping):
+            raise ValueError("users must contain mappings")
+        user_id = str(raw.get("user_id", "")).strip()
+        username = str(raw.get("username", "")).strip()
+        role = str(raw.get("role", "")).strip()
+        join_time = str(raw.get("join_time", "")).strip()
+        if not user_id or user_id in seen_user_ids:
+            raise ValueError("user ids must be non-empty and unique")
+        if not username or role not in {"admin", "user", "banned"} or not join_time:
+            raise ValueError("user identity fields are invalid")
+        seen_user_ids.add(user_id)
+        snapshot = build_progress_snapshot(
+            problem_records,
+            submission_records,
+            user_id,
+            difficulty_normalizer=difficulty_normalizer,
+            generated_at=str(generated_at),
+        )
+        statistics = snapshot["stats"]
+        kpis = statistics["kpis"]
+        scope = statistics["scope"]
+        outcome_counts = {outcome: 0 for outcome in ADMIN_OUTCOME_IDS}
+        for submission in submission_records:
+            if str(submission.get("user_id", "")) == user_id:
+                outcome_counts[_admin_submission_outcome(submission)] += 1
+        prepared_users.append(
+            {
+                "user_id": user_id,
+                "username": username,
+                "role": role,
+                "account_status": "disabled" if role == "banned" else "active",
+                "join_time": join_time,
+                "submission_count": scope["submission_count"],
+                "attempted_count": kpis["attempted_count"],
+                "passed_count": kpis["passed_count"],
+                "earned_score": kpis["earned_score"],
+                "available_score": kpis["available_score"],
+                "score_rate": _rate(kpis["earned_score"], kpis["available_score"]),
+                "pass_rate": kpis["pass_rate"],
+                "submission_outcomes": [
+                    {"id": outcome, "count": outcome_counts[outcome]}
+                    for outcome in ADMIN_OUTCOME_IDS
+                ],
+            }
+        )
+
+    role_order = {"admin": 0, "user": 1, "banned": 2}
+    prepared_users.sort(
+        key=lambda row: (
+            role_order[row["role"]],
+            row["username"].casefold(),
+            row["username"],
+            row["user_id"],
+        )
+    )
+    attempted = sum(row["attempted_count"] for row in prepared_users)
+    passed = sum(row["passed_count"] for row in prepared_users)
+    earned = _sum_numbers(row["earned_score"] for row in prepared_users)
+    available = _sum_numbers(row["available_score"] for row in prepared_users)
+    aggregate_outcomes = {outcome: 0 for outcome in ADMIN_OUTCOME_IDS}
+    for row in prepared_users:
+        for outcome in row["submission_outcomes"]:
+            aggregate_outcomes[outcome["id"]] += outcome["count"]
+    return {
+        "schema_version": ADMIN_LEARNING_OVERVIEW_SCHEMA,
+        "generated_at": str(generated_at),
+        "timezone": "UTC",
+        "summary": {
+            "account_count": len(prepared_users),
+            "active_count": sum(row["account_status"] == "active" for row in prepared_users),
+            "disabled_count": sum(row["account_status"] == "disabled" for row in prepared_users),
+            "learner_count": sum(row["role"] == "user" for row in prepared_users),
+            "engaged_count": sum(row["attempted_count"] > 0 for row in prepared_users),
+            "submission_count": sum(row["submission_count"] for row in prepared_users),
+            "attempted_count": attempted,
+            "passed_count": passed,
+            "earned_score": earned,
+            "available_score": available,
+            "score_rate": _rate(earned, available),
+            "pass_rate": _rate(passed, attempted),
+        },
+        "submission_outcomes": [
+            {"id": outcome, "count": aggregate_outcomes[outcome]} for outcome in ADMIN_OUTCOME_IDS
+        ],
+        "users": prepared_users,
+    }
+
+
 def _prepare_problems(
     problems: Iterable[Mapping[str, Any]],
     normalizer: DifficultyNormalizer | None,
@@ -198,6 +363,9 @@ def _prepare_problems(
             raise ValueError("problem testcases must be a list")
         tags = _dedupe_tags(canonical["tags"])
         difficulty = _difficulty(str(canonical["difficulty"] or ""), normalizer)
+        public_cases = raw.get("public_cases", False)
+        if not isinstance(public_cases, bool):
+            raise ValueError("problem public_cases must be a boolean")
         prepared.append(
             {
                 "problem_id": problem_id,
@@ -206,9 +374,12 @@ def _prepare_problems(
                 "available_score": len(cases) * 10,
                 "tags": tags,
                 "difficulty": difficulty,
+                "public_cases": public_cases,
             }
         )
-        canonical_records.append(canonical)
+        # Visibility is not a problem-version field, but it must invalidate a
+        # Chat context epoch because it changes which diagnostics are allowed.
+        canonical_records.append({**canonical, "public_cases": public_cases})
     return prepared, canonical_records
 
 
@@ -218,6 +389,7 @@ def _prepare_submissions(
     problem_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     prepared = []
+    seen_submission_ids = set()
     for raw in submissions:
         if str(raw.get("user_id", "")) != user_id:
             continue
@@ -225,11 +397,15 @@ def _prepare_submissions(
         problem_id = str(raw.get("problem_id", "")).strip()
         if not submission_id or not problem_id:
             raise ValueError("submission ids and problem ids must be non-empty")
+        if submission_id in seen_submission_ids:
+            raise ValueError("submission ids must be unique")
+        seen_submission_ids.add(submission_id)
         status = str(raw.get("status", ""))
         if status not in {"pending", "success", "error"}:
             raise ValueError("invalid submission status")
         created_at = str(raw.get("created_at", ""))
         created_time = _utc_datetime(created_at)
+        language = _submission_language(raw.get("language"))
         score = _optional_number(raw.get("score"), "score")
         counts = _optional_number(raw.get("counts"), "counts")
         _validate_score_state(status, score, counts)
@@ -239,6 +415,7 @@ def _prepare_submissions(
             raise ValueError("version_inferred must be a boolean")
 
         problem = problem_by_id.get(problem_id)
+        public_cases = bool(problem and problem["public_cases"])
         if problem is None:
             relation = "orphan"
         elif submitted_version is None:
@@ -255,6 +432,7 @@ def _prepare_submissions(
                 "score": score,
                 "counts": counts,
                 "created_at": created_at,
+                "language": language,
                 "problem_version": submitted_version,
                 "version_inferred": inferred,
                 "revision": raw.get("revision"),
@@ -262,7 +440,12 @@ def _prepare_submissions(
                 "created_time": created_time,
                 "date": created_time.date().isoformat(),
                 "outcome": _outcome(status, score, counts),
-                "verdict": _submission_verdict(raw, status, score, counts),
+                "verdict": _submission_verdict(
+                    raw, status, score, counts, public_cases=public_cases
+                ),
+                "chat_outcome": _chat_outcome(
+                    raw, status, score, counts, public_cases=public_cases
+                ),
             }
         )
     prepared.sort(key=_latest_order)
@@ -365,7 +548,7 @@ def _learning_stats(
         outcome_counts[submission["outcome"]] += 1
 
     problem_ids = {problem["problem_id"] for problem in problems}
-    return {
+    stats = {
         "schema_version": LEARNING_STATS_SCHEMA,
         "context_epoch": epoch,
         "generated_at": generated_at,
@@ -405,6 +588,233 @@ def _learning_stats(
             }
             for item, fact in zip(items, facts, strict=True)
         ],
+    }
+    stats["chat_context"] = _chat_context(
+        epoch,
+        generated_at,
+        problems,
+        submissions,
+        items,
+        facts,
+        earned=earned,
+        available=available,
+    )
+    return stats
+
+
+def _chat_context(
+    epoch: str,
+    generated_at: str,
+    problems: list[dict[str, Any]],
+    submissions: list[dict[str, Any]],
+    items: list[dict[str, Any]],
+    facts: list[dict[str, Any]],
+    *,
+    earned: int | float,
+    available: int | float,
+) -> dict[str, Any]:
+    """Build the bounded, source-only projection consumed by programming chat."""
+
+    omissions = set()
+    relations = {relation: 0 for relation in ("current", "outdated", "unknown", "orphan")}
+    outcome_counts = {outcome: 0 for outcome in CHAT_OUTCOME_IDS}
+    language_counts: dict[str, int] = {}
+    submissions_by_problem: dict[str, list[dict[str, Any]]] = {}
+    for submission in submissions:
+        relations[submission["relation"]] += 1
+        outcome_counts[submission["chat_outcome"]] += 1
+        language = submission["language"]
+        language_counts[language] = language_counts.get(language, 0) + 1
+        submissions_by_problem.setdefault(submission["problem_id"], []).append(submission)
+
+    if relations["orphan"]:
+        omissions.add("orphan_problem_metadata")
+    if relations["unknown"]:
+        omissions.add("submission_version_unknown")
+    if relations["outdated"]:
+        omissions.add("outdated_submission_version")
+    if outcome_counts["pending"]:
+        omissions.add("pending_submission_results")
+    if language_counts.get(UNKNOWN_LANGUAGE_ID):
+        omissions.add("submission_language_unknown")
+
+    per_problem = []
+    chat_facts = []
+    for problem, item, fact in zip(problems, items, facts, strict=True):
+        problem_submissions = submissions_by_problem.get(problem["problem_id"], [])
+        latest = max(problem_submissions, key=_latest_order, default=None)
+        chat_fact = dict(fact)
+        chat_fact["attempted"] = any(
+            submission["relation"] == "current" and submission["status"] != "pending"
+            for submission in problem_submissions
+        )
+        chat_facts.append(chat_fact)
+        title, title_truncated = _bounded_source_text(
+            problem["title"], CHAT_CONTEXT_MAX_TITLE_BYTES
+        )
+        knowledge_points, knowledge_truncated = _bounded_knowledge(problem["tags"])
+        if title_truncated:
+            omissions.add("problem_titles_truncated")
+        if knowledge_truncated:
+            omissions.add("problem_knowledge_truncated")
+        per_problem.append(
+            {
+                "problem_id": problem["problem_id"],
+                "title": title,
+                "difficulty_id": fact["difficulty"]["id"],
+                "knowledge_points": knowledge_points,
+                "state": item["state"],
+                "latest_outcome": latest["chat_outcome"] if latest is not None else None,
+                "best_score": item["best"]["score"] if item["best"] is not None else None,
+                "available_score": fact["available_score"],
+                "attempt_count": len(problem_submissions),
+                "last_submitted_at": (
+                    _utc_text(latest["created_time"]) if latest is not None else None
+                ),
+            }
+        )
+    per_problem.sort(key=_chat_problem_order)
+    total_problem_count = len(per_problem)
+    if total_problem_count > CHAT_CONTEXT_MAX_PROBLEMS:
+        per_problem = per_problem[:CHAT_CONTEXT_MAX_PROBLEMS]
+        omissions.add("problem_details_truncated")
+
+    recent_source = sorted(submissions, key=_latest_order, reverse=True)
+    total_recent_activity_count = len(recent_source)
+    if total_recent_activity_count > CHAT_CONTEXT_MAX_RECENT_ACTIVITY:
+        recent_source = recent_source[:CHAT_CONTEXT_MAX_RECENT_ACTIVITY]
+        omissions.add("recent_activity_truncated")
+    recent_activity = [
+        {
+            "submission_id": submission["submission_id"],
+            "problem_id": submission["problem_id"],
+            "status": submission["status"],
+            "outcome": submission["chat_outcome"],
+            "score": submission["score"],
+            "counts": submission["counts"],
+            "language": submission["language"],
+            "relation": submission["relation"],
+            "created_at": _utc_text(submission["created_time"]),
+        }
+        for submission in recent_source
+    ]
+
+    difficulty_groups: dict[str | None, dict[str, Any]] = {}
+    for row in _difficulty_aggregates(chat_facts):
+        difficulty_id = row["difficulty_id"]
+        group = difficulty_groups.setdefault(
+            difficulty_id,
+            {
+                "id": difficulty_id,
+                "attempted": 0,
+                "passed": 0,
+                "earned_score": 0,
+                "available_score": 0,
+            },
+        )
+        group["attempted"] += row["attempted"]
+        group["passed"] += row["passed"]
+        group["earned_score"] = _clean_number(group["earned_score"] + row["earned_score"])
+        group["available_score"] = _clean_number(group["available_score"] + row["available_score"])
+    difficulty = list(difficulty_groups.values())
+    difficulty.sort(key=lambda row: (row["id"] is None, str(row["id"])))
+    total_difficulty_count = len(difficulty)
+    if total_difficulty_count > CHAT_CONTEXT_MAX_DIFFICULTIES:
+        difficulty = difficulty[:CHAT_CONTEXT_MAX_DIFFICULTIES]
+        omissions.add("difficulty_aggregates_truncated")
+
+    knowledge_groups: dict[str, dict[str, Any]] = {}
+    for row in _knowledge_point_aggregates(chat_facts):
+        knowledge_id, shortened = _bounded_source_text(row["tag"], CHAT_CONTEXT_MAX_KNOWLEDGE_BYTES)
+        if shortened:
+            omissions.add("problem_knowledge_truncated")
+        if not knowledge_id:
+            continue
+        group = knowledge_groups.setdefault(
+            knowledge_id,
+            {
+                "id": knowledge_id,
+                "attempted": 0,
+                "passed": 0,
+                "earned_score": 0,
+                "available_score": 0,
+            },
+        )
+        group["attempted"] += row["attempted"]
+        group["passed"] += row["passed"]
+        group["earned_score"] = _clean_number(group["earned_score"] + row["earned_score"])
+        group["available_score"] = _clean_number(group["available_score"] + row["available_score"])
+    knowledge = list(knowledge_groups.values())
+    knowledge.sort(key=lambda row: (-row["attempted"], row["id"].casefold(), row["id"]))
+    total_knowledge_count = len(knowledge)
+    if total_knowledge_count > CHAT_CONTEXT_MAX_KNOWLEDGE:
+        knowledge = knowledge[:CHAT_CONTEXT_MAX_KNOWLEDGE]
+        omissions.add("knowledge_aggregates_truncated")
+
+    language = [
+        {"id": language_id, "count": count}
+        for language_id, count in sorted(
+            language_counts.items(), key=lambda pair: (-pair[1], pair[0].casefold(), pair[0])
+        )
+    ]
+    total_language_count = len(language)
+    if total_language_count > CHAT_CONTEXT_MAX_LANGUAGES:
+        kept = language[: CHAT_CONTEXT_MAX_LANGUAGES - 1]
+        kept.append(
+            {
+                "id": OTHER_LANGUAGE_ID,
+                "count": sum(row["count"] for row in language[CHAT_CONTEXT_MAX_LANGUAGES - 1 :]),
+            }
+        )
+        language = kept
+        omissions.add("language_aggregates_truncated")
+
+    ordered_omissions = [value for value in CHAT_CONTEXT_OMISSIONS if value in omissions]
+    attempted = sum(fact["attempted"] for fact in chat_facts)
+    passed = sum(fact["passed"] for fact in chat_facts)
+    return {
+        "schema_version": CHAT_CONTEXT_SCHEMA,
+        "context_epoch": epoch,
+        "generated_at": generated_at,
+        "coverage": {
+            "status": "partial" if ordered_omissions else "complete",
+            "omissions": ordered_omissions,
+        },
+        "summary": {
+            "catalog_problem_count": len(problems),
+            "submission_count": len(submissions),
+            "catalog_linked_submission_count": len(submissions) - relations["orphan"],
+            "orphan_submission_count": relations["orphan"],
+            "current_version_submission_count": relations["current"],
+            "outdated_version_submission_count": relations["outdated"],
+            "version_unknown_submission_count": relations["unknown"],
+            "pending_submission_count": outcome_counts["pending"],
+            "attempted_problem_count": attempted,
+            "passed_problem_count": passed,
+            "earned_score": earned,
+            "available_score": available,
+            "pass_rate": _rate(passed, attempted),
+            "included_problem_count": len(per_problem),
+            "total_recent_activity_count": total_recent_activity_count,
+            "included_recent_activity_count": len(recent_activity),
+            "total_difficulty_count": total_difficulty_count,
+            "included_difficulty_count": len(difficulty),
+            "total_knowledge_count": total_knowledge_count,
+            "included_knowledge_count": len(knowledge),
+            "total_language_count": total_language_count,
+            "included_language_count": len(language),
+            "content_projection": "source",
+        },
+        "per_problem": per_problem,
+        "recent_activity": recent_activity,
+        "aggregates": {
+            "difficulty": difficulty,
+            "knowledge": knowledge,
+            "outcome": [
+                {"id": outcome, "count": outcome_counts[outcome]} for outcome in CHAT_OUTCOME_IDS
+            ],
+            "language": language,
+        },
     }
 
 
@@ -548,9 +958,11 @@ def _context_epoch(
             "score": item["score"],
             "counts": item["counts"],
             "created_at": item["created_at"],
+            "language": item["language"],
             "problem_version": item["problem_version"],
             "version_inferred": item["version_inferred"],
             "verdict": item["verdict"],
+            "chat_outcome": item["chat_outcome"],
         }
         for item in submissions
     ]
@@ -618,6 +1030,58 @@ def _dedupe_tags(value: Any) -> list[str]:
     return result
 
 
+def _bounded_source_text(value: Any, maximum_bytes: int) -> tuple[str, bool]:
+    text = str(value or "")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return text, False
+    shortened = encoded[:maximum_bytes]
+    while True:
+        try:
+            return shortened.decode("utf-8"), True
+        except UnicodeDecodeError as error:
+            shortened = shortened[: error.start]
+
+
+def _bounded_knowledge(values: list[str]) -> tuple[list[str], bool]:
+    bounded = []
+    seen = set()
+    truncated = len(values) > CHAT_CONTEXT_MAX_PROBLEM_KNOWLEDGE
+    for value in sorted(values, key=lambda item: (item.casefold(), item))[
+        :CHAT_CONTEXT_MAX_PROBLEM_KNOWLEDGE
+    ]:
+        safe, shortened = _bounded_source_text(value, CHAT_CONTEXT_MAX_KNOWLEDGE_BYTES)
+        marker = safe.casefold()
+        if safe and marker not in seen:
+            bounded.append(safe)
+            seen.add(marker)
+        else:
+            truncated = True
+        truncated = truncated or shortened
+    return bounded, truncated
+
+
+def _submission_language(value: Any) -> str:
+    if value is None or not str(value).strip():
+        return UNKNOWN_LANGUAGE_ID
+    language = str(value).strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_+.-]{0,63}", language) is None:
+        raise ValueError("submission language is invalid")
+    return language
+
+
+def _chat_problem_order(problem: Mapping[str, Any]) -> tuple[int, float, str]:
+    submitted = problem["last_submitted_at"]
+    if submitted is None:
+        return 1, 0.0, problem["problem_id"]
+    timestamp = _utc_datetime(submitted).timestamp()
+    return 0, -timestamp, problem["problem_id"]
+
+
+def _utc_text(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _utc_datetime(value: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -674,11 +1138,41 @@ def _outcome(status: str, score: int | float | None, counts: int | float | None)
     return "zero_score"
 
 
+def _admin_submission_outcome(raw: Mapping[str, Any]) -> str:
+    """Reduce one validated submission to a non-sensitive admin chart category."""
+
+    status = str(raw.get("status", ""))
+    if status == "pending":
+        return "pending"
+    if status != "success":
+        return "judge_error"
+    score = raw.get("score")
+    counts = raw.get("counts")
+    if counts is not None and counts > 0 and score == counts:
+        return "accepted"
+    if score is not None and score > 0:
+        return "partial"
+    compile_info = raw.get("compile_info")
+    if isinstance(compile_info, Mapping) and compile_info.get("result") == "error":
+        return "compile_error"
+    details = raw.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, Mapping):
+                continue
+            verdict = _JUDGE_VERDICTS.get(detail.get("result"))
+            if verdict is not None:
+                return verdict
+    return "judge_error"
+
+
 def _submission_verdict(
     raw: Mapping[str, Any],
     status: str,
     score: int | float | None,
     counts: int | float | None,
+    *,
+    public_cases: bool,
 ) -> str:
     """Reduce private judge details to one allow-listed, display-safe enum."""
 
@@ -691,7 +1185,7 @@ def _submission_verdict(
     if score is not None and score > 0:
         return "partial"
     details = raw.get("details")
-    if isinstance(details, list):
+    if public_cases and isinstance(details, list):
         for detail in details:
             if not isinstance(detail, Mapping):
                 continue
@@ -699,6 +1193,35 @@ def _submission_verdict(
             if verdict is not None:
                 return verdict
     return "judge_error"
+
+
+def _chat_outcome(
+    raw: Mapping[str, Any],
+    status: str,
+    score: int | float | None,
+    counts: int | float | None,
+    *,
+    public_cases: bool,
+) -> str:
+    """Expose only an authorized error category, never a private judge detail."""
+
+    if status == "pending":
+        return "pending"
+    if status != "success":
+        return "judge_error"
+    if counts is not None and counts > 0 and score == counts:
+        return "accepted"
+    details = raw.get("details")
+    if public_cases and isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, Mapping):
+                continue
+            verdict = _JUDGE_VERDICTS.get(detail.get("result"))
+            if verdict is not None:
+                return verdict
+    if score is not None and score > 0:
+        return "partial"
+    return "zero_score"
 
 
 def _valid_best(submission: Mapping[str, Any]) -> bool:

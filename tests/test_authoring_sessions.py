@@ -8,8 +8,11 @@ import pytest
 
 from oj.authoring_sessions import (
     IDEMPOTENCY_NAMESPACE,
+    MAX_TASK_STATE_BYTES,
     SESSION_NAMESPACE,
     AuthoringSessionService,
+    _normalize_task,
+    _task_usage,
     normalize_request,
 )
 from oj.common import APIError
@@ -159,7 +162,72 @@ def authoring_request(requirement="设计一道有向图判环题", **updates):
     return value
 
 
-async def environment(tmp_path, ai=None, *, clock=None, ids=None):
+def canonical_draft(value, difficulty="普及+/提高-"):
+    return {**copy.deepcopy(value), "difficulty": difficulty}
+
+
+def test_cumulative_usage_keeps_completed_totals_while_active_revision_is_incomplete():
+    revisions = [
+        {
+            "task": {
+                "provider_calls": 1,
+                "usage": usage(2000, 768, cost=0.030636, incomplete=False),
+            }
+        },
+        {
+            "task": {
+                "provider_calls": 0,
+                "usage": usage(None, None, cost=0.0, incomplete=True),
+            }
+        },
+    ]
+
+    assert _task_usage(revisions) == {
+        "revision_count": 2,
+        "provider_calls": 1,
+        "incomplete": True,
+        "input_tokens": 2000,
+        "output_tokens": 768,
+        "total_tokens": 2768,
+        "cost": 0.030636,
+        "currency": "USD",
+    }
+
+
+def completed_task_with_payload(size):
+    return {
+        "task_id": "task-large",
+        "status": "completed",
+        "progress": "completed",
+        "progress_percent": 100,
+        "result": {"bounded_generated_payload": "x" * size},
+        "error": None,
+        "error_code": None,
+        "retryable": False,
+        "error_detail": None,
+        "provider_calls": 1,
+        "usage": usage(10, 5, incomplete=False),
+        "elapsed_seconds": 1.0,
+    }
+
+
+def test_task_persistence_limit_matches_generated_output_contract():
+    accepted = _normalize_task(completed_task_with_payload(2 * 1024 * 1024))
+    assert len(accepted["result"]["bounded_generated_payload"]) == 2 * 1024 * 1024
+
+    with pytest.raises(APIError, match="state exceeds the size limit") as error:
+        _normalize_task(completed_task_with_payload(MAX_TASK_STATE_BYTES + 1))
+    assert error.value.status == 502
+
+
+async def environment(
+    tmp_path,
+    ai=None,
+    *,
+    clock=None,
+    ids=None,
+    persistence_poll_seconds=60,
+):
     store = Store(tmp_path / "authoring.sqlite3")
     await store.initialize()
     ai = ai or FakeAI()
@@ -170,6 +238,7 @@ async def environment(tmp_path, ai=None, *, clock=None, ids=None):
         cancel_task=ai.cancel,
         clock=clock or Clock(),
         id_factory=ids or Ids(),
+        persistence_poll_seconds=persistence_poll_seconds,
     )
     return store, ai, service
 
@@ -455,7 +524,7 @@ async def test_poll_completion_then_failed_refinement_preserves_last_good_draft_
     ai.complete("task-1", draft)
     completed = await service.poll(initial["session_id"], "alice")
     assert completed["status"] == "completed"
-    assert completed["draft"] == draft
+    assert completed["draft"] == canonical_draft(draft)
     assert completed["latest_success_revision"] == 1
     get_count = [event[0] for event in ai.events].count("get")
     await service.poll(initial["session_id"], "alice")
@@ -471,7 +540,8 @@ async def test_poll_completion_then_failed_refinement_preserves_last_good_draft_
     assert refinement["current_revision"] == 2
     payload = prompt_payload(ai, "task-2")
     assert payload["operation"] == "refine_draft"
-    assert payload["latest_successful_draft"] == draft
+    assert payload["base_revision"] == 1
+    assert payload["latest_successful_draft"] == canonical_draft(draft)
     assert payload["improvement"] == "补充无环和自环边界，并降低题面歧义"
     assert payload["original_request"]["requirement"] == "设计一道有向图判环题"
 
@@ -479,7 +549,7 @@ async def test_poll_completion_then_failed_refinement_preserves_last_good_draft_
     failed = await service.poll(initial["session_id"], "alice")
     assert failed["status"] == "failed"
     assert failed["latest_success_revision"] == 1
-    assert failed["draft"] == draft
+    assert failed["draft"] == canonical_draft(draft)
     assert failed["revisions"][1]["task"]["error_code"] == "synthetic_failure"
     assert failed["cumulative_usage"] == {
         "revision_count": 2,
@@ -491,6 +561,102 @@ async def test_poll_completion_then_failed_refinement_preserves_last_good_draft_
         "cost": 0.15,
         "currency": "USD",
     }
+
+
+@pytest.mark.asyncio
+async def test_terminal_revision_is_persisted_without_client_poll_and_survives_restart(tmp_path):
+    store, ai, service = await environment(tmp_path, persistence_poll_seconds=0.001)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+    draft = {"id": "AI-BACKGROUND-001", "title": "后台完成的草稿"}
+    final_usage = usage(21, 13, cost=0.23, incomplete=False)
+
+    ai.complete("task-1", draft, task_usage=final_usage, calls=2)
+    for _ in range(100):
+        stored = await store.get(SESSION_NAMESPACE, initial["session_id"])
+        if stored["revisions"][0]["task"]["status"] == "completed":
+            break
+        await asyncio.sleep(0.002)
+    else:
+        pytest.fail("background persistence did not store the completed revision")
+
+    restarted = AuthoringSessionService(
+        store,
+        start_task=ai.start,
+        get_task=ai.get,
+        cancel_task=ai.cancel,
+        clock=Clock(),
+        id_factory=Ids(),
+    )
+    assert await restarted.recover_after_restart() == 0
+    recovered = await restarted.get(initial["session_id"], "alice")
+    assert recovered["status"] == "completed"
+    assert recovered["draft"] == canonical_draft(draft)
+    assert recovered["latest_success_revision"] == 1
+    assert recovered["revisions"][0]["task"]["usage"] == final_usage
+    assert recovered["revisions"][0]["task"]["provider_calls"] == 2
+
+
+class PausedTerminalReadAI(FakeAI):
+    """Pause the first completed snapshot after reading it to expose a stale merge."""
+
+    def __init__(self):
+        super().__init__()
+        self.snapshot_read = asyncio.Event()
+        self.release_snapshot = asyncio.Event()
+        self._paused = False
+
+    async def get(self, task_id, owner_id):
+        self.events.append(("get", task_id))
+        snapshot = self._public(task_id)
+        if task_id == "task-1" and snapshot["status"] == "completed" and not self._paused:
+            self._paused = True
+            self.snapshot_read.set()
+            await self.release_snapshot.wait()
+        return snapshot
+
+
+@pytest.mark.asyncio
+async def test_delayed_old_revision_observer_cannot_erase_new_revision(tmp_path):
+    ai = PausedTerminalReadAI()
+    store, _, service = await environment(
+        tmp_path,
+        ai,
+        persistence_poll_seconds=0.001,
+    )
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+    ai.complete("task-1", {"id": "AI-RACE-001", "title": "first"})
+    await asyncio.wait_for(ai.snapshot_read.wait(), timeout=1)
+
+    replaced = await service.replace_requirements(
+        initial["session_id"],
+        "alice",
+        authoring_request(requirement="newer revision"),
+        expected_revision=1,
+        idempotency_key="replace",
+    )
+    assert replaced["current_revision"] == 2
+    ai.release_snapshot.set()
+    await asyncio.sleep(0.01)
+
+    stored = await store.get(SESSION_NAMESPACE, initial["session_id"])
+    assert stored["current_revision"] == 2
+    assert len(stored["revisions"]) == 2
+    assert stored["revisions"][0]["task"]["status"] == "completed"
+    assert stored["revisions"][1]["task"]["task_id"] == "task-2"
+    assert stored["revisions"][1]["task"]["status"] in {"pending", "running"}
+
+
+@pytest.mark.asyncio
+async def test_service_close_flushes_provider_result_that_already_completed(tmp_path):
+    store, ai, service = await environment(tmp_path, persistence_poll_seconds=60)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+    ai.complete("task-1", {"id": "AI-SHUTDOWN-001", "title": "completed before shutdown"})
+
+    await service.close()
+
+    stored = await store.get(SESSION_NAMESPACE, initial["session_id"])
+    assert stored["revisions"][0]["task"]["status"] == "completed"
+    assert stored["latest_success_revision"] == 1
 
 
 @pytest.mark.asyncio
@@ -517,7 +683,7 @@ async def test_multiple_refinements_keep_history_and_base_only_on_last_success(t
         idempotency_key="r2",
     )
     payload = prompt_payload(ai, "task-3")
-    assert payload["latest_successful_draft"] == first_draft
+    assert payload["latest_successful_draft"] == canonical_draft(first_draft)
     assert payload["original_request"]["requirement"] == "设计一道有向图判环题"
     assert payload["refinement_history"] == [
         {"revision": 2, "improvement": "first improvement", "status": "failed"}
@@ -526,6 +692,106 @@ async def test_multiple_refinements_keep_history_and_base_only_on_last_success(t
     final = await service.poll(initial["session_id"], "alice")
     assert final["latest_success_revision"] == 3
     assert final["draft"]["title"] == "Improved"
+
+
+@pytest.mark.asyncio
+async def test_completed_result_uses_selected_canonical_difficulty(tmp_path):
+    store, ai, service = await environment(tmp_path)
+    initial = await service.initial(
+        "alice",
+        authoring_request(difficulty_id="luogu.6"),
+        idempotency_key="initial",
+    )
+    provider_result = {"id": "AI-DIFFICULTY", "title": "Provider draft", "difficulty": ""}
+    ai.complete("task-1", provider_result)
+
+    completed = await service.poll(initial["session_id"], "alice")
+    assert completed["draft"]["difficulty"] == "提高+/省选-"
+    assert completed["revisions"][0]["task"]["result"]["difficulty"] == "提高+/省选-"
+    assert ai.tasks["task-1"]["result"]["difficulty"] == ""
+    stored = await store.get(SESSION_NAMESPACE, initial["session_id"])
+    assert stored["revisions"][0]["task"]["result"]["difficulty"] == "提高+/省选-"
+
+
+@pytest.mark.asyncio
+async def test_refinement_can_branch_from_any_successful_historical_revision(tmp_path):
+    _, ai, service = await environment(tmp_path)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+    first = {"id": "AI-BRANCH", "title": "First"}
+    ai.complete("task-1", first)
+    await service.poll(initial["session_id"], "alice")
+    await service.replace_requirements(
+        initial["session_id"],
+        "alice",
+        authoring_request(requirement="a different second-branch request"),
+        expected_revision=1,
+        idempotency_key="second-branch",
+    )
+    second = {"id": "AI-BRANCH", "title": "Second"}
+    ai.complete("task-2", second)
+    await service.poll(initial["session_id"], "alice")
+
+    branched = await service.refine_draft(
+        initial["session_id"],
+        "alice",
+        "branch from the first draft",
+        expected_revision=2,
+        base_revision=1,
+        idempotency_key="branch",
+    )
+    payload = prompt_payload(ai, "task-3")
+    assert payload["base_revision"] == 1
+    assert payload["latest_successful_draft"] == canonical_draft(first)
+    assert payload["current_request"]["requirement"] == "设计一道有向图判环题"
+    assert branched["revisions"][2]["parent_revision"] == 1
+    assert branched["revisions"][2]["request"]["requirement"] == "设计一道有向图判环题"
+    assert branched["current_revision"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("base_revision", [0, True, "1"])
+async def test_refinement_rejects_invalid_base_revision_type(tmp_path, base_revision):
+    _, ai, service = await environment(tmp_path)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+    ai.complete("task-1", {"id": "AI-BASE", "title": "First"})
+    await service.poll(initial["session_id"], "alice")
+
+    with pytest.raises(APIError) as caught:
+        await service.refine_draft(
+            initial["session_id"],
+            "alice",
+            "improve",
+            expected_revision=1,
+            base_revision=base_revision,
+            idempotency_key=f"invalid-{base_revision}",
+        )
+    assert caught.value.status == 400
+
+
+@pytest.mark.asyncio
+async def test_refinement_rejects_non_successful_base_revision(tmp_path):
+    _, ai, service = await environment(tmp_path)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+    ai.complete("task-1", {"id": "AI-BASE", "title": "First"})
+    await service.poll(initial["session_id"], "alice")
+    await service.replace_requirements(
+        initial["session_id"],
+        "alice",
+        authoring_request(requirement="second pending"),
+        expected_revision=1,
+        idempotency_key="replace",
+    )
+
+    with pytest.raises(APIError) as caught:
+        await service.refine_draft(
+            initial["session_id"],
+            "alice",
+            "do not use pending base",
+            expected_revision=2,
+            base_revision=2,
+            idempotency_key="bad-base",
+        )
+    assert caught.value.status == 409
 
 
 @pytest.mark.asyncio

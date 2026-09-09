@@ -13,7 +13,7 @@ async def main():
     sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--live", action="store_true", help="Allow one authoring task (at most two billed calls)"
+        "--live", action="store_true", help="Allow one authoring task (at most three billed calls)"
     )
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     args = parser.parse_args()

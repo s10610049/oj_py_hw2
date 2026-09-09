@@ -18,7 +18,11 @@ from pathlib import Path
 import httpx
 
 from oj.common import APIError
-from oj.authoring_checks import check_generated
+from oj.authoring_checks import (
+    check_generated,
+    discard_one_unexecutable_testcase,
+    materialize_literal_answers,
+)
 from oj.pricing import resolve_pricing
 from oj.schemas import text_field, validate_problem
 from oj.translations import embedded_english_translation
@@ -32,6 +36,10 @@ MAX_OUTPUT_TOKENS = 8000
 MAX_PROVIDER_CALLS = 3
 TERMINAL = {"completed", "cancelled", "failed"}
 PRICE_NOTE = "费用按配置单价估算，缓存命中/峰谷价格可能不同，不等于官方账单。"
+DEFAULT_VALIDATION_NOTES = (
+    "模型未单独提供校验说明；系统已实际运行参考解并逐项核对测试答案，"
+    "仍需在入库前人工审阅题意、算法正确性与边界覆盖。"
+)
 _SAFE_CHECK = re.compile(r"authoring_check:[a-z_]+(?::(?:case|line)=\d+){0,2}")
 
 
@@ -90,6 +98,9 @@ output_description、constraints、hint；只翻译公开题面文字，不改�
 后台会实际检查参考解与每个答案的一致性；必须严格读取输入，不忽略缺失数据。
 必须附 test_generator（Python代码字符串），通过确定性循环构造4—8组补充输入（最多12组），
 并 print(json.dumps(inputs)) 输出字符串数组；不输出答案，后台用参考解计算。
+生成器输出的整个JSON必须小于1.5 MiB，每个输入字符串必须小于800 KiB；用紧凑数据达到
+自行声明的最大规模，不展开稠密图、全排列或超长重复文本。若用户没有指定精确范围，应选择
+符合这些字节上限但仍能区分目标复杂度的上界；用户明确指定的范围则不得擅自缩小。
 计数头部必须使用 len 实际计算，不能与构造条数不符。生成器运行两次应完全一致。
 参考解和生成器仅可用算法语句、普通函数、input/print 和标准库 sys.stdin/stdout、collections、
 math、heapq、bisect、itertools、functools、random（显式seed）、json.dumps/loads。
@@ -286,6 +297,7 @@ class _Task:
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = "pending"
     progress: str = "命题任务已创建，等待开始"
+    progress_percent: int = 5
     result: dict | None = None
     error: str | None = None
     error_code: str | None = None
@@ -332,6 +344,7 @@ class _Task:
                 "task_id": self.task_id,
                 "status": self.status,
                 "progress": self.progress,
+                "progress_percent": self.progress_percent,
                 "result": self.result,
                 "error": self.error,
                 "error_code": self.error_code,
@@ -456,7 +469,6 @@ class AIService:
         if task.status in TERMINAL:
             raise APIError(409, "AI task has already ended")
         task.status = "cancelled"
-        task.progress = "命题已中断，后台请求已停止"
         task.ended = time.perf_counter()
         task.usage["incomplete"] = True
         task.usage["note"] += " 任务中断，用量可能不完整。"
@@ -480,6 +492,7 @@ class AIService:
     async def _run(self, task):
         task.status = "running"
         task.progress = "正在连接模型并提交命题需求"
+        task.progress_percent = max(task.progress_percent, 10)
         try:
             result = await asyncio.wait_for(self._author(task), TASK_TIMEOUT_SECONDS)
             # Reference/generator execution can synthesize strings not present
@@ -491,6 +504,7 @@ class AIService:
                 task.result = result
                 task.status = "completed"
                 task.progress = "参考解与测例一致性校验完成，请审阅题意和覆盖后入库"
+                task.progress_percent = 100
                 task.usage["incomplete"] = task.usage["source"] in {
                     "provider_partial",
                     "unavailable",
@@ -537,7 +551,6 @@ class AIService:
     def _fail(task, message, *, error_code, retryable, detail=None):
         if task.status not in TERMINAL:
             task.status = "failed"
-            task.progress = "命题失败"
             task.error = message
             task.error_code = error_code
             task.retryable = retryable
@@ -546,14 +559,59 @@ class AIService:
 
     @staticmethod
     def _estimate(task):
-        if task.usage["source"].startswith("provider"):
+        source = task.usage["source"]
+        if source == "provider":
             return
         input_bytes = sum(len(message["content"].encode()) for message in task.messages)
         output_bytes = len(task.output.encode()) + task.reasoning_bytes
+        estimated_input = math.ceil(input_bytes / 3)
+        estimated_output = math.ceil(output_bytes / 3)
+        if source == "provider_partial":
+            estimated_fields = set(task.usage.get("estimated_fields", []))
+            input_tokens = (
+                estimated_input
+                if "input_tokens" in estimated_fields
+                else task.usage["input_tokens"]
+            )
+            output_tokens = (
+                estimated_output
+                if "output_tokens" in estimated_fields
+                else task.usage["output_tokens"]
+            )
+            reported_total = task.usage.get("provider_reported_total_tokens")
+            calculated_total = input_tokens + output_tokens
+            if reported_total is not None and calculated_total < reported_total:
+                remainder = reported_total - calculated_total
+                # Keep exact provider components intact. When both components are
+                # missing, place an unclassified remainder on the more expensive
+                # side so the displayed estimate cannot understate the known total.
+                if "output_tokens" in estimated_fields and (
+                    "input_tokens" not in estimated_fields
+                    or task.usage["output_price"] >= task.usage["input_price"]
+                ):
+                    output_tokens += remainder
+                else:
+                    input_tokens += remainder
+                calculated_total = reported_total
+            if reported_total is None or calculated_total > reported_total:
+                estimated_fields.add("total_tokens")
+            task.usage.update(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=calculated_total,
+                estimated_fields=sorted(estimated_fields),
+                incomplete=True,
+                note=(
+                    "提供商仅返回部分Token用量；缺失项按完整请求消息与已接收输出的"
+                    "UTF-8字节数/3粗估。" + PRICE_NOTE
+                ),
+            )
+            _price(task.usage)
+            return
         task.usage.update(
-            input_tokens=math.ceil(input_bytes / 3),
-            output_tokens=math.ceil(output_bytes / 3),
-            total_tokens=math.ceil(input_bytes / 3) + math.ceil(output_bytes / 3),
+            input_tokens=estimated_input,
+            output_tokens=estimated_output,
+            total_tokens=estimated_input + estimated_output,
             source="estimated",
             note="未收到完整提供商用量，按UTF-8字节数/3粗估；非模型分词器或账单实测。" + PRICE_NOTE,
         )
@@ -581,11 +639,21 @@ class AIService:
             if pairs["total_tokens"] is not None and pairs["total_tokens"] != calculated:
                 raise APIError(500, "模型用量数据不一致")
             pairs["total_tokens"] = calculated
+        task.usage.pop("estimated_fields", None)
+        task.usage.pop("provider_reported_total_tokens", None)
         task.usage.update(pairs)
         task.usage["source"] = "provider" if complete else "provider_partial"
         task.usage["note"] = "提供商返回的Token计数。" if complete else "提供商仅返回部分用量。"
         task.usage["note"] += PRICE_NOTE
-        _price(task.usage)
+        if complete:
+            _price(task.usage)
+        else:
+            task.usage["estimated_fields"] = [
+                name for name in ("input_tokens", "output_tokens") if pairs[name] is None
+            ]
+            if pairs["total_tokens"] is not None:
+                task.usage["provider_reported_total_tokens"] = pairs["total_tokens"]
+            AIService._estimate(task)
 
     def _event(self, task, raw):
         if raw.strip() == "[DONE]":
@@ -620,6 +688,8 @@ class AIService:
                 raise APIError(500, "模型生成内容超过安全长度限制")
             if content or reasoning:
                 task.progress = f"正在接收模型生成内容（已接收{len(task.output)}个正文字符）"
+                received_kib = (len(task.output.encode()) + task.reasoning_bytes) // 1024
+                task.progress_percent = max(task.progress_percent, min(55, 30 + int(received_kib)))
                 self._estimate(task)
             finish = choice.get("finish_reason")
             if finish in {"length", "content_filter"}:
@@ -644,12 +714,19 @@ class AIService:
                 "上一稿不是可解析的严格JSON。删除代码围栏和前后说明，检查引号、反斜杠、"
                 "逗号与换行转义，确保正文从{开始并以}结束。"
             )
-        elif "schema" in category:
+        elif "schema" in category or category == "problem_translation":
             targeted = (
                 "上一稿字段合同不完整或类型错误。逐项补齐id、题面、输入输出说明、约束、"
                 "samples、testcases、time_limit、memory_limit、reference_solution、"
-                "validation_notes及translations.en完整六项题面翻译，并确保数组元素和字符串"
-                "类型符合系统提示。"
+                "validation_notes、test_generator、test_generation_notes及translations.en完整"
+                "六项题面翻译，并确保数组元素和字符串类型符合系统提示。"
+            )
+        elif category in {"generator_output", "generator_output_size"}:
+            targeted = (
+                "上一稿生成器输出超过安全上限。将全部生成输入的JSON总量控制在1.5 MiB内、"
+                "每个输入控制在800 KiB内，减少展开的边或元素数量，避免稠密图、全排列和"
+                "超长重复文本。若范围是上一稿自行选择，可在保持算法与难度的前提下同步修正"
+                "题面上界；用户明确指定的精确范围不得缩小。"
             )
         elif category.startswith("generator") or category in {
             "combined_output_size",
@@ -664,6 +741,20 @@ class AIService:
             targeted = (
                 "参考解未通过静态或执行检查。提供完整可运行的Python3参考解，只使用系统"
                 "允许的语法和标准库，严格读取标准输入并在限制内输出唯一正确答案。"
+                "任何变量名都不能含连续两个下划线；未使用的循环变量请写_unused。"
+            )
+            if category == "reference_execution":
+                targeted += (
+                    "错误码中的case编号对应testcases从1开始的位置；必须逐个token手算该输入，"
+                    "检查声明合法性和容器操作。不要对可能不存在的集合元素直接remove，"
+                    "也不要在输入字段数量不足时继续next；修正测例或算法后重新计算全部答案。"
+                )
+        elif category == "answer_mismatch":
+            targeted = (
+                "后台已实际运行参考解，发现错误码所指的字面测例答案与程序输出不一致。"
+                "请以最终reference_solution为准，逐个执行或逐token复算所有samples和"
+                "testcases的output，检查计数、排序、并列规则、空白和大小写；不要只修改"
+                "报错的一个测例，也不要在validation_notes里保留未解决的自我质疑。"
             )
         else:
             targeted = (
@@ -677,6 +768,53 @@ class AIService:
             )
         return f"后台校验类别：{code}。{targeted}{common}"
 
+    @staticmethod
+    def _deterministic_generator_fallback(candidate, code):
+        """Salvage an otherwise valid draft when only its generator is unsafe.
+
+        The fallback deliberately re-emits a bounded subset of the model's
+        already supplied literal inputs.  It cannot invent domain semantics,
+        so the human-review notes make the reduced stress coverage explicit.
+        ``check_generated`` still executes the generator twice and validates
+        every answer through the reference solution before accepting the draft.
+        """
+
+        category = code.removeprefix("authoring_check:").split(":", 1)[0]
+        if not (
+            category.startswith("generator") or category in {"combined_output_size", "case_limit"}
+        ):
+            return None
+        if not isinstance(candidate, dict):
+            return None
+        raw_cases = candidate.get("testcases")
+        if not isinstance(raw_cases, list) or not raw_cases:
+            return None
+        inputs = []
+        for case in raw_cases[:8]:
+            value = case.get("input") if isinstance(case, dict) else None
+            if not isinstance(value, str):
+                return None
+            if value not in inputs:
+                inputs.append(value)
+        if not inputs:
+            return None
+        source = (
+            "import json\n"
+            f"inputs = {json.dumps(inputs, ensure_ascii=True)}\n"
+            "print(json.dumps(inputs))\n"
+        )
+        if len(source.encode("utf-8")) > 32_000:
+            return None
+        fallback = copy.deepcopy(candidate)
+        fallback["test_generator"] = source
+        note = (
+            "系统安全回退：模型生成器未通过执行门禁，现使用正式测试点输入构造确定性生成器；"
+            "答案已由参考解重新核验，但压力数据覆盖需在入库前人工复查。"
+        )
+        existing = str(fallback.get("test_generation_notes") or "").strip()
+        fallback["test_generation_notes"] = f"{existing} {note}".strip()
+        return fallback
+
     async def _record_candidate_evidence(self, task, attempt, candidate, code):
         if self._evidence_directory is None or _contains_secret(candidate, task.config["api_key"]):
             return
@@ -689,18 +827,8 @@ class AIService:
             pass  # Optional diagnostics must not change task correctness.
 
     @staticmethod
-    def _prepare_retry(task, feedback):
-        task.messages += [
-            {"role": "assistant", "content": task.output},
-            {"role": "user", "content": feedback},
-        ]
-        if sum(len(message["content"].encode()) for message in task.messages) > MAX_PROMPT_BYTES:
-            raise _TaskFailure(
-                "自动修正上下文超过安全长度，请直接重新发起命题任务",
-                error_code="authoring_repair_context_too_large",
-                retryable=True,
-            )
-        task.usage["incomplete"] = task.usage["source"] in {
+    def _reset_attempt(task, *, force_incomplete=False):
+        task.usage["incomplete"] = force_incomplete or task.usage["source"] in {
             "provider_partial",
             "zero_before_start",
         }
@@ -709,14 +837,79 @@ class AIService:
         task.output = ""
         task.reasoning_bytes = 0
 
+    @staticmethod
+    def _check_retry_prompt_size(task):
+        if sum(len(message["content"].encode()) for message in task.messages) > MAX_PROMPT_BYTES:
+            raise _TaskFailure(
+                "自动修正上下文超过安全长度，请直接重新发起命题任务",
+                error_code="authoring_repair_context_too_large",
+                retryable=True,
+            )
+
+    @classmethod
+    def _prepare_retry(cls, task, feedback):
+        task.messages += [
+            {"role": "assistant", "content": task.output},
+            {"role": "user", "content": feedback},
+        ]
+        cls._check_retry_prompt_size(task)
+        cls._reset_attempt(task)
+
+    @classmethod
+    def _prepare_fresh_retry(cls, task, code):
+        """Use the final provider call for a fresh design after repeated semantic failure."""
+
+        task.messages = copy.deepcopy(task.messages[:2])
+        task.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"前两稿均未通过后台校验（{code}）。不要复用前稿题面、测例、"
+                    "参考解或生成器；请从原始用户要求重新设计另一道完整题目。"
+                    "先在内部逐项手算所有小测例，再输出精简、严格、完整的JSON对象。"
+                ),
+            }
+        )
+        cls._check_retry_prompt_size(task)
+        cls._reset_attempt(task)
+
+    @classmethod
+    def _prepare_incomplete_retry(cls, task):
+        """Retry a provider-truncated response without echoing partial JSON back."""
+
+        task.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "上一响应因输出长度限制而截断。请重新从头输出一个完整、严格且更精简的"
+                    "JSON对象，不要续写残片，不要附加Markdown。保留原题意和难度；压缩说明"
+                    "文字，只保留4个小型字面测试点与4个确定性生成点，代码保持完整可运行。"
+                ),
+            }
+        )
+        cls._check_retry_prompt_size(task)
+        cls._reset_attempt(task, force_incomplete=True)
+
     async def _author(self, task):
         for attempt in range(MAX_PROVIDER_CALLS):
             candidate = None
             try:
                 candidate = await self._generate(task)
                 return await check_generated(
-                    candidate, lambda message: setattr(task, "progress", message)
+                    candidate, lambda message: self._check_progress(task, message)
                 )
+            except _TaskFailure as error:
+                if (
+                    error.error_code == "provider_output_incomplete"
+                    and attempt < MAX_PROVIDER_CALLS - 1
+                ):
+                    task.progress = (
+                        "模型响应被截断，正在缩短输出并进行" f"第{attempt + 1}次自动重试"
+                    )
+                    task.progress_percent = max(task.progress_percent, 58)
+                    self._prepare_incomplete_retry(task)
+                    continue
+                raise
             except APIError as error:
                 safe = _SAFE_CHECK.fullmatch(error.message)
                 if not safe:
@@ -725,6 +918,55 @@ class AIService:
                 evidence_candidate = candidate if candidate is not None else task.output
                 await self._record_candidate_evidence(task, attempt, evidence_candidate, code)
                 if attempt == MAX_PROVIDER_CALLS - 1:
+                    recovery_candidate = candidate
+                    fallback = self._deterministic_generator_fallback(candidate, code)
+                    if fallback is not None:
+                        recovery_candidate = fallback
+                        task.progress = "生成器连续未通过门禁，正在应用确定性安全回退并复验"
+                        task.progress_percent = max(task.progress_percent, 78)
+                        try:
+                            return await check_generated(
+                                fallback,
+                                lambda message: self._check_progress(task, message),
+                            )
+                        except APIError as fallback_error:
+                            fallback_code = _SAFE_CHECK.fullmatch(fallback_error.message)
+                            if fallback_code:
+                                code = fallback_code.group(0)
+                    category = code.removeprefix("authoring_check:").split(":", 1)[0]
+                    if category == "reference_execution" and isinstance(recovery_candidate, dict):
+                        task.progress = "模型连续包含单个无法执行的隐藏测例，正在隔离后完整复验"
+                        task.progress_percent = max(task.progress_percent, 78)
+                        try:
+                            recovery_candidate = await discard_one_unexecutable_testcase(
+                                recovery_candidate,
+                                lambda message: self._check_progress(task, message),
+                            )
+                            return await check_generated(
+                                recovery_candidate,
+                                lambda message: self._check_progress(task, message),
+                            )
+                        except APIError as fallback_error:
+                            fallback_code = _SAFE_CHECK.fullmatch(fallback_error.message)
+                            if fallback_code:
+                                code = fallback_code.group(0)
+                    category = code.removeprefix("authoring_check:").split(":", 1)[0]
+                    if category == "answer_mismatch" and isinstance(recovery_candidate, dict):
+                        task.progress = "模型连续未正确手算字面答案，正在用安全参考解重新计算并复验"
+                        task.progress_percent = max(task.progress_percent, 78)
+                        try:
+                            materialized = await materialize_literal_answers(
+                                recovery_candidate,
+                                lambda message: self._check_progress(task, message),
+                            )
+                            return await check_generated(
+                                materialized,
+                                lambda message: self._check_progress(task, message),
+                            )
+                        except APIError as fallback_error:
+                            fallback_code = _SAFE_CHECK.fullmatch(fallback_error.message)
+                            if fallback_code:
+                                code = fallback_code.group(0)
                     raise _TaskFailure(
                         "生成的题目连续未通过一致性校验；这是生成结果问题，可直接重试，"
                         "无需修改有效的命题要求",
@@ -736,7 +978,42 @@ class AIService:
                     f"校验发现{code.removeprefix('authoring_check:')}问题，"
                     f"正在进行第{attempt + 1}次自动修正"
                 )
-                self._prepare_retry(task, self._repair_feedback(code))
+                task.progress_percent = max(task.progress_percent, 62)
+                category = code.removeprefix("authoring_check:").split(":", 1)[0]
+                semantic = category in {
+                    "answer_mismatch",
+                    "generated_problem_schema",
+                    "reference_execution",
+                    "reference_memory",
+                    "reference_output",
+                    "reference_timeout",
+                }
+                if attempt == MAX_PROVIDER_CALLS - 2 and semantic:
+                    self._prepare_fresh_retry(task, code)
+                else:
+                    self._prepare_retry(task, self._repair_feedback(code))
+
+    @staticmethod
+    def _check_progress(task, message):
+        """Advance a monotonic stage bar from real authoring-check callbacks."""
+
+        task.progress = message
+        target = 65
+        if "等待人工审阅" in message:
+            target = 96
+        elif "静态检查" in message:
+            target = 68
+        elif "第 1 次" in message:
+            target = 74
+        elif "第 2 次" in message:
+            target = 80
+        elif "参考解与答案" in message:
+            match = re.search(r"（(\d+)/(\d+)）", message)
+            if match and int(match.group(2)) > 0:
+                target = 82 + round(12 * int(match.group(1)) / int(match.group(2)))
+            else:
+                target = 82
+        task.progress_percent = max(task.progress_percent, min(96, target))
 
     async def _generate(self, task):
         url, extra_headers, extensions = await self._destination(task.config["provider_url"])
@@ -776,6 +1053,7 @@ class AIService:
                 if "text/event-stream" not in response.headers.get("content-type", "").lower():
                     raise APIError(500, "模型未返回所请求的流式响应")
                 task.progress = "模型已连接，正在等待生成内容"
+                task.progress_percent = max(task.progress_percent, 20)
                 async for line in self._bounded_lines(response):
                     if not line:
                         if event_lines:
@@ -788,9 +1066,11 @@ class AIService:
                         event_lines.append(line[5:].lstrip(" "))
                 if event_lines:
                     finished = self._event(task, "\n".join(event_lines)) or finished
+        self._estimate(task)
         if not finished or not task.output.strip():
             raise APIError(500, "模型流提前结束，未产生完整题目")
         task.progress = "已收到模型内容，正在校验题目字段与测例格式"
+        task.progress_percent = max(task.progress_percent, 60)
         if task.config["api_key"] in task.output:
             raise APIError(500, "模型响应包含敏感配置，已阻止展示")
         try:
@@ -802,16 +1082,37 @@ class AIService:
         try:
             result = validate_problem(value)
             translation = embedded_english_translation(value)
-            if translation is not None:
-                result["translations"] = {"en": translation}
+            if translation is None:
+                # A completed AI draft is a bilingual producer contract.  A
+                # legacy provider response without ``translations.en`` enters
+                # the existing bounded repair loop instead of becoming a
+                # silently half-translated success.
+                raise _RepairableCandidate("authoring_check:problem_translation")
+            result["translations"] = {"en": translation}
             for name in (
                 "reference_solution",
                 "test_generator",
                 "validation_notes",
                 "test_generation_notes",
             ):
-                if name in value:
-                    result[name] = text_field(value[name], name, maximum=100_000)
+                # These are all mandatory parts of an AI-authored draft.  In
+                # particular, a missing generator must not skip the execution
+                # checks and still become a successful task.  Treat omissions
+                # as a repairable producer-contract failure so the existing
+                # bounded retry loop can repair them, then fail structurally if
+                # all attempts remain incomplete.
+                raw = value.get(name)
+                if name == "validation_notes" and (
+                    raw is None or isinstance(raw, str) and not raw.strip()
+                ):
+                    # This field is explanatory metadata rather than executable
+                    # problem semantics.  A truthful system-authored note is
+                    # safer than discarding an otherwise fully checked draft
+                    # after a repair response accidentally omits it.
+                    raw = DEFAULT_VALIDATION_NOTES
+                result[name] = text_field(raw, name, maximum=100_000)
+        except _RepairableCandidate:
+            raise
         except APIError as error:
             if "敏感配置" in error.message:
                 raise

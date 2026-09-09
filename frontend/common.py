@@ -5,8 +5,7 @@ import html
 import streamlit as st
 
 from frontend.client import APIClient, APIError
-
-ROLE_LABELS = {"admin": "管理员", "user": "学习者", "banned": "已禁用"}
+from frontend.i18n import api_error_message, locale, t
 
 
 def api():
@@ -32,40 +31,45 @@ def notice(message):
     st.session_state["_notice"] = message
 
 
-def clear_session(message="已退出登录。"):
+def clear_session(message=None):
     current = st.session_state.get("_api")
+    selected_locale = locale()
     if current:
         current.close()
     st.session_state.clear()
-    st.session_state["_notice"] = message
+    st.session_state["_locale"] = selected_locale
+    st.session_state["_notice"] = message or t("session.logged_out")
 
 
 def show_error(exc):
     labels = {
-        0: "连接暂不可用",
-        400: "请检查输入",
-        401: "登录状态已失效",
-        403: "无法执行此操作",
-        404: "未找到记录",
-        409: "记录状态已变化",
-        429: "请求过于频繁，请稍后再试",
-        500: "服务暂时异常",
-        502: "响应异常",
+        0: "error.connection",
+        400: "error.input",
+        401: "error.auth",
+        403: "error.permission",
+        404: "error.not_found",
+        409: "error.conflict",
+        429: "error.rate_limit",
+        500: "error.server",
+        502: "error.response",
     }
-    st.error(f"{labels.get(exc.status, '操作失败')}：{exc.message}")
+    separator = "：" if locale() == "zh-CN" else ": "
+    st.error(
+        t(labels.get(exc.status, "error.generic")) + separator + api_error_message(exc.message)
+    )
 
 
 def poll_error(exc):
     if exc.status == 401:
-        clear_session("登录已失效，请重新登录。")
+        clear_session(t("session.login_expired"))
         st.rerun(scope="app")
     show_error(exc)
-    st.caption("保留上次已确认状态；连接失败不表示后台任务已停止。")
+    st.caption(t("poll.preserved"))
 
 
 def score_text(record):
     if record.get("score") is None or record.get("counts") is None:
-        return "尚未返回"
+        return t("score.pending")
     return f"{record['score']} / {record['counts']}"
 
 
@@ -89,7 +93,9 @@ def data_table(records):
         for record in records
     )
     st.html(
-        '<div class="oj-table-scroll" tabindex="0" role="region" aria-label="数据表">'
+        '<div class="oj-table-scroll" tabindex="0" role="region" aria-label="'
+        + html.escape(t("table.aria"), quote=True)
+        + '">'
         '<table class="oj-table"><thead><tr>'
         + header
         + "</tr></thead><tbody>"
@@ -104,7 +110,7 @@ def mutation(method, path, *, json=None):
         return True, api().request(method, path, json=json)
     except APIError as exc:
         if exc.status == 401:
-            clear_session("登录已失效，请重新登录。")
+            clear_session(t("session.login_expired"))
             st.rerun()
         show_error(exc)
         return False, None

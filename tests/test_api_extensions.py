@@ -77,6 +77,9 @@ async def test_personal_progress_routes_are_private_consistent_and_additive(tmp_
             )
             statuses = data(await client.get("/api/me/problem-statuses/"))
             stats = data(await client.get("/api/me/learning-stats/"))
+            untranslated = data(
+                await client.get("/api/me/learning-stats/", params={"locale": "en"})
+            )
             assert statuses["context_epoch"] == stats["context_epoch"]
             assert statuses["items"][0]["state"] == "passed"
             assert stats["kpis"] == {
@@ -88,6 +91,25 @@ async def test_personal_progress_routes_are_private_consistent_and_additive(tmp_
             }
             rendered = str((statuses, stats))
             assert "SECRET_CODE" not in rendered and "SECRET_CASE" not in rendered
+            assert untranslated["display_locale"] == "en"
+            assert untranslated["problems"][0]["display_title"] is None
+
+            translation = {
+                "title": "Integer sum",
+                "description": "Add two integers.",
+                "input_description": "Read two integers.",
+                "output_description": "Print their sum.",
+                "constraints": "Absolute values are at most one billion.",
+                "hint": "",
+            }
+            data(await client.put("/api/problems/sum/translations/en", json=translation))
+            translated = data(
+                await client.get("/api/me/learning-stats/", params={"locale": "en-US"})
+            )
+            assert translated["display_locale"] == "en"
+            assert translated["problems"][0]["display_title"] == "Integer sum"
+            assert "SECRET_CODE" not in str(translated) and "SECRET_CASE" not in str(translated)
+            data(await client.get("/api/me/learning-stats/", params={"locale": "fr"}), 400)
             # The existing course list contract remains available and additive
             # routes do not require or accept a target user id.
             assert data(await client.get("/api/problems/"))[0]["id"] == "sum"
@@ -135,6 +157,46 @@ async def test_new_submission_captures_problem_version_and_rejudge_refreshes_it(
             assert refreshed["problem_version"] != old_version
             assert refreshed["problem_title"] == "新版求和"
             assert refreshed["version_inferred"] is False
+
+
+@pytest.mark.anyio
+async def test_startup_migrates_known_difficulties_without_expiring_current_scores(tmp_path):
+    app = create_app(tmp_path / "difficulty-migration.sqlite3", bcrypt_rounds=4, ai_config={})
+    await app.state.store.initialize()
+    legacy = {**PROBLEM, "difficulty": "基础", "public_cases": False}
+    custom = {**PROBLEM, "id": "custom", "difficulty": "school-level"}
+    old_digest = problem_version_digest(legacy)
+    await app.state.store.put("problems", "sum", legacy)
+    await app.state.store.put("problems", "custom", custom)
+    for submission_id, version in (("current", old_digest), ("outdated", "0" * 64)):
+        await app.state.store.put(
+            "submissions",
+            submission_id,
+            {
+                "submission_id": submission_id,
+                "user_id": "1",
+                "problem_id": "sum",
+                "difficulty_raw": "基础",
+                "problem_version": version,
+                "status": "success",
+                "score": 20,
+                "counts": 20,
+                "created_at": "2026-09-09T12:00:00+00:00",
+                "revision": 1,
+            },
+        )
+
+    async with app.router.lifespan_context(app):
+        migrated = await app.state.store.get("problems", "sum")
+        assert migrated["difficulty"] == "普及-"
+        new_digest = problem_version_digest(migrated)
+        assert new_digest != old_digest
+        current = await app.state.store.get("submissions", "current")
+        outdated = await app.state.store.get("submissions", "outdated")
+        assert current["problem_version"] == new_digest
+        assert outdated["problem_version"] == "0" * 64
+        assert current["difficulty_raw"] == outdated["difficulty_raw"] == "普及-"
+        assert (await app.state.store.get("problems", "custom"))["difficulty"] == "school-level"
 
 
 @pytest.mark.anyio

@@ -186,6 +186,65 @@ def test_algorithm_subset_accepts_data_operations(source):
 
 
 @pytest.mark.asyncio
+async def test_generated_conventional_main_guard_is_normalized_without_widening_guard():
+    guarded = (
+        "def main():\n"
+        "    print(sum(map(int, input().split())))\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+    result = await checks.check_generated(problem(guarded), lambda _: None)
+    assert "__name__" not in result["reference_solution"]
+    assert result["reference_solution"].rstrip().endswith("main()")
+
+
+@pytest.mark.asyncio
+async def test_exact_double_underscore_loop_placeholder_is_safely_normalized():
+    reference = (
+        "import sys\n"
+        "data = iter(map(int, sys.stdin.read().split()))\n"
+        "values = [next(data) for __ in range(next(data))]\n"
+        "print(sum(values))\n"
+    )
+    value = problem(
+        reference,
+        cases=[{"input": "3 1 2 3", "output": "6"}],
+    )
+    result = await checks.check_generated(value, lambda _: None)
+    assert "for __ in" not in result["reference_solution"]
+    assert "_oj_unused" in result["reference_solution"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "print(__builtins__)",
+        "print((1).__class__)",
+        "def __():\n    return 1\nprint(__())",
+    ],
+)
+def test_placeholder_normalization_does_not_widen_dunder_access(source):
+    normalized = checks._normalize_generated_source(source)
+    with pytest.raises(APIError, match="reference_unsafe_source"):
+        checks._validate_source(normalized, "reference")
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def main():\n    print(6)\nif __name__ == '__main__':\n    main()\nelse:\n    print(7)",
+        "def main():\n    print(6)\nif __name__ == '__main__':\n    main()\n    print(7)",
+        "if __name__ == '__main__':\n    print(6)",
+    ],
+)
+def test_nonconventional_main_guards_remain_rejected(source):
+    normalized = checks._normalize_generated_entrypoint(source)
+    assert normalized == source
+    with pytest.raises(APIError, match="reference_unsafe_source"):
+        checks._validate_source(normalized, "reference")
+
+
+@pytest.mark.asyncio
 async def test_array_generator_real_determinism_samples_and_immutable_input():
     generator = (
         "import json, random\nrandom.seed(23)\n"
@@ -298,6 +357,102 @@ async def test_literal_and_sample_answer_disagreement_fails_with_index(sample):
         value["testcases"][0]["output"] = "7"
     with pytest.raises(APIError, match=f"answer_mismatch:case={2 if sample else 1}"):
         await checks.check_generated(value, lambda _: None)
+
+
+@pytest.mark.asyncio
+async def test_materialize_literal_answers_syncs_duplicates_then_passes_full_gate():
+    reference = """import sys
+text = sys.stdin.read().lower()
+counts = []
+for code in range(97, 123):
+    letter = chr(code)
+    amount = text.count(letter)
+    if amount:
+        counts.append((amount, letter))
+counts.sort(key=lambda item: (-item[0], item[1]))
+for amount, letter in counts:
+    print(letter, amount)
+"""
+    value = problem(
+        reference,
+        cases=[
+            {"input": "Hello World\n", "output": "wrong\n"},
+            {"input": "A a b\n", "output": "also wrong\n"},
+        ],
+        samples=[{"input": "Hello World\n", "output": "different wrong\n"}],
+    )
+    value["validation_notes"] = "Model-authored note."
+
+    materialized = await checks.materialize_literal_answers(value, lambda _: None)
+
+    assert materialized["testcases"][0]["output"].splitlines() == [
+        "l 3",
+        "o 2",
+        "d 1",
+        "e 1",
+        "h 1",
+        "r 1",
+        "w 1",
+    ]
+    assert materialized["testcases"][1]["output"].splitlines() == ["a 2", "b 1"]
+    assert checks.normalize_output(materialized["samples"][0]["output"]) == (
+        checks.normalize_output(materialized["testcases"][0]["output"])
+    )
+    assert "系统一致性回退" in materialized["validation_notes"]
+    checked = await checks.check_generated(materialized, lambda _: None)
+    assert checked["quality"]["reference_checked"] is True
+
+
+@pytest.mark.asyncio
+async def test_materialize_literal_answers_never_salvages_unsafe_reference(monkeypatch):
+    async def unexpected(*args, **kwargs):
+        pytest.fail("Unsafe source must be rejected before execution")
+
+    monkeypatch.setattr(checks, "run_command", unexpected)
+    with pytest.raises(APIError, match="reference_unsafe_source"):
+        await checks.materialize_literal_answers(problem("print(open('/private'))"), lambda _: None)
+
+
+@pytest.mark.asyncio
+async def test_single_unexecutable_hidden_case_can_be_transparently_discarded():
+    reference = (
+        "import sys\n"
+        "value = int(sys.stdin.read())\n"
+        "if value == 13:\n"
+        "    raise ValueError()\n"
+        "print(value * 2)\n"
+    )
+    cases = [
+        {"input": "1\n", "output": "2\n"},
+        {"input": "2\n", "output": "4\n"},
+        {"input": "3\n", "output": "6\n"},
+        {"input": "13\n", "output": "26\n"},
+    ]
+    value = problem(reference, cases=cases, samples=cases[:1])
+
+    recovered = await checks.discard_one_unexecutable_testcase(value, lambda _: None)
+
+    assert [case["input"] for case in recovered["testcases"]] == ["1\n", "2\n", "3\n"]
+    assert recovered["samples"] == cases[:1]
+    assert "单个测例" in recovered["validation_notes"]
+    checked = await checks.check_generated(recovered, lambda _: None)
+    assert checked["quality"]["checked_cases"] == 3
+
+
+@pytest.mark.asyncio
+async def test_unexecutable_visible_sample_is_never_discarded():
+    reference = "value = int(input())\nif value == 13:\n    raise ValueError()\nprint(value)\n"
+    cases = [
+        {"input": "1\n", "output": "1\n"},
+        {"input": "2\n", "output": "2\n"},
+        {"input": "3\n", "output": "3\n"},
+        {"input": "13\n", "output": "13\n"},
+    ]
+
+    with pytest.raises(APIError, match="reference_execution"):
+        await checks.discard_one_unexecutable_testcase(
+            problem(reference, cases=cases, samples=cases[-1:]), lambda _: None
+        )
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import zipfile
 
 import pytest
 
+from frontend.import_template import native_problem_template
 from oj.problem_import import (
     ImportError,
     parse_luogu_archive,
@@ -26,6 +27,17 @@ def make_zip(entries, *, compression=zipfile.ZIP_STORED):
             else:
                 archive.writestr(name, value)
     return target.getvalue()
+
+
+def test_downloadable_native_template_is_deterministic_and_immediately_parseable():
+    first = native_problem_template()
+    second = native_problem_template()
+    parsed = parse_native_archive(first)
+
+    assert first == second
+    assert parsed.can_commit and parsed.problem["id"] == "MY-PROBLEM-001"
+    assert parsed.sample_count == 1 and parsed.testcase_count == 1
+    assert parsed.problem["translations"]["en"]["title"] == "A + B"
 
 
 def native_entries(*, english=True, wrapper=""):
@@ -312,6 +324,99 @@ def test_luogu_flat_accepts_complete_metadata_and_strict_safe_config():
     assert parsed.problem["time_limit"] == 1.5
     assert parsed.problem["memory_limit"] == 128
     assert parsed.sample_count == 1 and parsed.testcase_count == 2
+
+
+def test_luogu_flat_metadata_preserves_complete_english_prose_only():
+    metadata = full_luogu_metadata()
+    metadata["translations"] = {
+        "en": {
+            "title": "Local Data Problem",
+            "description": "Compute the answer.",
+            "input_description": "Read one integer.",
+            "output_description": "Print the result.",
+            "constraints": "The value fits in a signed integer.",
+            "hint": "Start with the sample.",
+        }
+    }
+    raw = make_zip({"1.in": "1\n", "1.out": "1\n"})
+
+    parsed = parse_luogu_archive(raw, metadata=metadata)
+
+    assert parsed.problem["translations"] == metadata["translations"]
+    assert "testcases" not in parsed.problem["translations"]["en"]
+
+
+def test_luogu_flat_rejects_mixed_language_english_metadata():
+    metadata = full_luogu_metadata()
+    metadata["translations"] = {
+        "en": {
+            "title": "本地题目",
+            "description": "Compute the answer.",
+            "input_description": "Read one integer.",
+            "output_description": "Print the result.",
+            "constraints": "The value fits in a signed integer.",
+            "hint": "",
+        }
+    }
+
+    with pytest.raises(ImportError) as caught:
+        parse_luogu_archive(make_zip({"1.in": "1", "1.out": "1"}), metadata=metadata)
+
+    assert caught.value.code == "METADATA_TRANSLATION_INVALID"
+
+
+def test_luogu_promotes_identical_limits_only_when_every_case_defines_them():
+    config = {
+        "cases": [
+            {
+                "input": "1.in",
+                "output": "1.out",
+                "time_limit": 1.5,
+                "memory_limit": 128,
+            },
+            {
+                "input": "2.in",
+                "output": "2.out",
+                "time_limit_ms": 1500,
+                "memory_limit_kb": 131072,
+            },
+        ]
+    }
+    raw = make_zip(
+        {
+            "1.in": "1",
+            "1.out": "1",
+            "2.in": "2",
+            "2.out": "2",
+            "config.yml": json.dumps(config),
+        }
+    )
+    parsed = parse_luogu_archive(raw, config_loader=json.loads)
+    assert parsed.problem["time_limit"] == 1.5
+    assert parsed.problem["memory_limit"] == 128
+
+
+@pytest.mark.parametrize(("field", "value"), [("time_limit", 1), ("memory_limit", 128)])
+def test_luogu_rejects_partial_per_case_limit_instead_of_promoting_it(field, value):
+    config = {
+        "cases": [
+            {"input": "1.in", "output": "1.out", field: value},
+            {"input": "2.in", "output": "2.out"},
+        ]
+    }
+    raw = make_zip(
+        {
+            "1.in": "1",
+            "1.out": "1",
+            "2.in": "2",
+            "2.out": "2",
+            "config.yml": json.dumps(config),
+        }
+    )
+    with pytest.raises(ImportError) as caught:
+        parse_luogu_archive(raw, config_loader=json.loads)
+    assert caught.value.code == "UNSUPPORTED_PARTIAL_CASE_LIMITS"
+    assert caught.value.field == field
 
 
 @pytest.mark.parametrize(

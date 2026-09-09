@@ -16,7 +16,8 @@ from typing import Any
 from oj.common import APIError
 from oj.schemas import text_field
 
-CONTENT_SCHEMA = "oj.problem-content.v1"
+CONTENT_SCHEMA = "oj.problem-content.v2"
+LEGACY_CONTENT_SCHEMA = "oj.problem-content.v1"
 TRANSLATION_SCHEMA = "oj.problem-translation.v1"
 SUPPORTED_LOCALES = ("zh-CN", "en")
 TRANSLATABLE_FIELDS = (
@@ -28,6 +29,20 @@ TRANSLATABLE_FIELDS = (
     "hint",
 )
 TRANSLATION_SOURCES = {"manual", "import", "ai", "seed"}
+
+_CJK = tuple(
+    (start, end)
+    for start, end in (
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xF900, 0xFAFF),
+        (0x20000, 0x2FA1F),
+    )
+)
+
+
+def _contains_cjk(value: str) -> bool:
+    return any(start <= ord(character) <= end for character in value for start, end in _CJK)
 
 
 def normalize_locale(value: Any) -> str:
@@ -69,7 +84,7 @@ def source_digest(problem: Mapping[str, Any]) -> str:
 
 
 def validate_translation(value: Any) -> dict[str, str]:
-    """Validate one complete English prose translation without judge fields."""
+    """Validate one complete, English-only prose translation without judge fields."""
 
     if not isinstance(value, Mapping):
         raise APIError(400, "Translation must be an object")
@@ -83,6 +98,8 @@ def validate_translation(value: Any) -> dict[str, str]:
             f"translation.{field}",
             minimum=0 if field == "hint" else 1,
         )
+        if _contains_cjk(result[field]):
+            raise APIError(400, f"Translation field {field} must be English")
     return result
 
 
@@ -129,7 +146,14 @@ def localized_content(
     locale: str,
     record: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return a complete display projection with explicit fallback metadata."""
+    """Return a complete display projection without cross-language fallback.
+
+    ``oj.problem-content.v2`` deliberately fails closed for English.  When the
+    English record is missing, stale, or malformed, every prose field is empty
+    and ``resolved_locale`` is ``None``.  Canonical Chinese remains available
+    through an explicit ``locale=zh-CN`` request, but is never masqueraded as
+    English content.
+    """
 
     locale = normalize_locale(locale)
     digest = source_digest(problem)
@@ -172,11 +196,11 @@ def localized_content(
     return {
         "schema_version": CONTENT_SCHEMA,
         "requested_locale": "en",
-        "resolved_locale": "zh-CN",
+        "resolved_locale": None,
         "status": state,
-        "fallback": True,
+        "fallback": False,
         "source_digest": digest,
-        "fields": canonical,
+        "fields": {field: "" for field in TRANSLATABLE_FIELDS},
     }
 
 

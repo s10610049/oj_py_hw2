@@ -1,5 +1,7 @@
 """Submission list, live results and explicitly requested authorized logs."""
 
+import re
+
 import streamlit as st
 
 from frontend.client import APIError, resource
@@ -14,47 +16,106 @@ from frontend.common import (
     score_text,
     user,
 )
+from frontend.i18n import locale as current_locale
+from frontend.i18n import t
 
 STATUS = {"pending": "评测中", "success": "评测完成", "error": "评测异常"}
+VERDICTS = {"AC", "WA", "CE", "TLE", "MLE", "RE", "UNK"}
+INFO_RESULTS = {"success", "error", "finished"}
+
+
+def verdict_label(value, locale_code=None):
+    code = str(value or "").strip().upper()
+    return t(f"submission.verdict.{code}", locale_code) if code in VERDICTS else code
+
+
+def info_result_label(value, locale_code=None):
+    key = str(value or "").strip().lower()
+    return t(f"submission.result.{key}", locale_code) if key in INFO_RESULTS else str(value or "")
+
+
+def message_projection(value, locale_code=None):
+    """Localize structured judge prose and explicitly mark opaque diagnostics."""
+
+    text = str(value or "").strip()
+    selected = current_locale() if locale_code is None else locale_code
+    known = {
+        "Compilation exceeded its limit": "submission.message.compilation_limit",
+        "评测被服务重启中断，请重新评测": "submission.message.service_restarted",
+        "Judge infrastructure failed": "submission.message.infrastructure_failed",
+        "Judge could not complete this submission": "submission.message.judge_incomplete",
+    }
+    if text in known:
+        return t(known[text], locale_code), False
+    summary = re.fullmatch(
+        r"(?P<count>\d+) test cases finished(?:\nOverall errors: (?P<errors>.+))?",
+        text,
+    )
+    if summary:
+        lines = [t("submission.message.cases_finished", locale_code, count=summary["count"])]
+        if summary["errors"]:
+            errors = (", " if selected == "en" else "、").join(
+                verdict_label(item.strip(), locale_code)
+                for item in summary["errors"].split(",")
+                if item.strip()
+            )
+            lines.append(t("submission.message.overall_errors", locale_code, errors=errors))
+        return "\n".join(lines), False
+    if selected == "en" and any("\u3400" <= character <= "\u9fff" for character in text):
+        return t("submission.message.infrastructure_failed", locale_code), False
+    return text, bool(text)
+
+
+def status_label(value):
+    return t(f"submission.status.{value}") if value in STATUS else str(value)
 
 
 def render_result(record):
     status = record["status"]
     if status == "pending":
-        st.status("代码已接收，正在评测", state="running", type="compact")
+        st.status(t("submission.received"), state="running", type="compact")
     elif status == "error":
-        st.error("评测任务异常，请查看错误信息。")
+        st.error(t("submission.task_error"))
     elif record.get("counts") and record.get("score") == record["counts"]:
-        st.success("全部通过 · AC")
+        st.success(t("submission.accepted"))
     else:
-        st.warning("评测完成，尚未全部通过。请查看编译、运行信息或授权日志。")
-    st.write("得分：" + score_text(record))
-    for key, title in (("compile_info", "编译信息"), ("run_info", "运行结果")):
+        st.warning(t("submission.incomplete"))
+    st.write(t("submission.score", score=score_text(record)))
+    for key, title in (
+        ("compile_info", t("submission.compile")),
+        ("run_info", t("submission.run")),
+    ):
         value = record.get(key)
         if value:
             st.subheader(title)
-            st.write(str(value.get("result", "")))
+            st.write(info_result_label(value.get("result", "")))
             if value.get("message"):
-                st.code(str(value["message"]), language="text")
+                message, technical = message_projection(value["message"])
+                if technical:
+                    st.caption(t("submission.technical_diagnostic"))
+                st.code(message, language="text")
     if record.get("error_info"):
-        st.subheader("错误信息")
-        st.code(str(record["error_info"]), language="text")
+        st.subheader(t("submission.error"))
+        message, technical = message_projection(record["error_info"])
+        if technical:
+            st.caption(t("submission.technical_diagnostic"))
+        st.code(message, language="text")
 
 
 def render_log(log):
-    st.write("日志得分：" + score_text(log))
+    st.write(t("submission.log_score", score=score_text(log)))
     if "details" not in log:
-        st.info("本题未公开逐测试点结果；当前权限仅可查看总分。")
+        st.info(t("submission.log_private"))
     elif not log["details"]:
-        st.caption("尚未产生逐测试点结果。")
+        st.caption(t("submission.log_pending"))
     else:
         data_table(
             [
                 {
-                    "测试点": item["id"],
-                    "结果": item["result"],
-                    "耗时（秒）": item["time"],
-                    "内存（MiB）": item["memory"],
+                    t("submission.column.case"): item["id"],
+                    t("submission.column.result"): verdict_label(item["result"]),
+                    t("submission.column.time"): item["time"],
+                    t("submission.column.memory"): item["memory"],
                 }
                 for item in log["details"]
             ],
@@ -62,9 +123,14 @@ def render_log(log):
 
 
 def submission_detail(submission_id):
-    st.button("← 返回提交列表", on_click=go, args=("提交记录",), kwargs={"_submission_id": None})
-    st.title("提交详情")
-    st.caption(f"提交编号：{submission_id}")
+    st.button(
+        t("submission.back"),
+        on_click=go,
+        args=("提交记录",),
+        kwargs={"_submission_id": None},
+    )
+    st.title(t("submission.detail"))
+    st.caption(t("submission.id", id=submission_id))
     cache_key = f"_submission_{submission_id}"
     cached = st.session_state.get(cache_key)
     active = not cached or cached.get("status") == "pending"
@@ -88,89 +154,106 @@ def submission_detail(submission_id):
             st.rerun(scope="app")
         if current.get("problem_id"):
             st.caption(
-                f"题目 {current['problem_id']} · {current.get('language', '')} · "
-                f"{current.get('created_at', '')}"
+                t(
+                    "submission.meta",
+                    problem=current["problem_id"],
+                    language=current.get("language", ""),
+                    time=current.get("created_at", ""),
+                )
             )
         render_result(current)
-        if st.button("刷新评测状态", key=f"refresh_{submission_id}"):
+        if st.button(t("submission.refresh"), key=f"refresh_{submission_id}"):
             st.session_state.pop(cache_key, None)
             st.rerun(scope="app")
         if current.get("code") is not None:
-            with st.expander("查看本次提交代码"):
+            with st.expander(t("submission.view_code")):
                 language = "cpp" if current.get("language") == "cpp" else "python"
                 st.code(current["code"], language=language)
         st.divider()
-        if st.button("查询评测日志", key=f"log_{submission_id}"):
+        if st.button(t("submission.query_log"), key=f"log_{submission_id}"):
             ok, data = mutation("GET", f"/api/submissions/{resource(submission_id)}/log")
             if ok:
                 st.session_state[f"_log_{submission_id}"] = data
         if f"_log_{submission_id}" in st.session_state:
             render_log(st.session_state[f"_log_{submission_id}"])
         if is_admin():
-            with st.expander("管理员操作"):
+            with st.expander(t("submission.admin")):
                 confirmed = st.checkbox(
-                    "重新评测会覆盖本次评测结果", key=f"confirm_rejudge_{submission_id}"
+                    t("submission.rejudge_confirm"), key=f"confirm_rejudge_{submission_id}"
                 )
-                if st.button("重新评测", disabled=not confirmed, key=f"rejudge_{submission_id}"):
+                if st.button(
+                    t("submission.rejudge"),
+                    disabled=not confirmed,
+                    key=f"rejudge_{submission_id}",
+                ):
                     ok, _ = mutation("PUT", f"/api/submissions/{resource(submission_id)}/rejudge")
                     if ok:
                         st.session_state.pop(cache_key, None)
                         st.session_state.pop(f"_log_{submission_id}", None)
-                        notice("已开始重新评测。")
+                        notice(t("submission.rejudge_started"))
                         st.rerun(scope="app")
 
     panel()
 
 
 def submission_list():
-    st.title("提交记录")
-    st.caption("每一次提交，都留下可回看的解题轨迹。")
+    st.title(t("submissions.title"))
+    st.caption(t("submissions.caption"))
     with st.form("submission_filters", border=False):
         a, b, c = st.columns(3)
-        problem_id = a.text_input("题号筛选（可选）")
+        problem_id = a.text_input(t("submissions.problem_filter"))
         status = b.selectbox(
-            "评测状态", ["全部"] + list(STATUS), format_func=lambda x: STATUS.get(x, x)
+            t("submissions.status_filter"),
+            ["all"] + list(STATUS),
+            format_func=lambda x: t("submissions.all") if x == "all" else status_label(x),
         )
-        owner = c.text_input("用户编号", value=user()["user_id"], disabled=not is_admin())
-        st.form_submit_button("查询记录", type="primary")
+        owner = c.text_input(
+            t("submissions.owner"), value=user()["user_id"], disabled=not is_admin()
+        )
+        st.form_submit_button(t("submissions.query"), type="primary")
     if not owner.strip() and not problem_id.strip():
-        st.info("请填写用户编号或题号。管理员可清空用户编号，查询某题的全部提交。")
+        st.info(t("submissions.filter_required"))
         return
-    page = st.number_input("提交列表页码", min_value=1, value=1, step=1)
+    page = st.number_input(t("submissions.page"), min_value=1, value=1, step=1)
     params = {"page": page, "page_size": 20}
     if owner.strip():
         params["user_id"] = owner.strip()
     if problem_id.strip():
         params["problem_id"] = problem_id.strip()
-    if status != "全部":
+    if status != "all":
         params["status"] = status
     result = api().request("GET", "/api/submissions/", params=params)
-    st.caption(f"共 {result['total']} 次提交")
+    st.caption(t("submissions.total", count=result["total"]))
     records = result["submissions"]
     if records:
         data_table(
             [
                 {
-                    "提交编号": x["submission_id"],
-                    "题目": x.get("problem_id", ""),
-                    "语言": x.get("language", ""),
-                    "状态": STATUS.get(x["status"], x["status"]),
-                    "得分": score_text(x),
-                    "提交时间": x.get("created_at", ""),
+                    t("submissions.column.id"): x["submission_id"],
+                    t("submissions.column.problem"): x.get("problem_id", ""),
+                    t("submissions.column.language"): x.get("language", ""),
+                    t("submissions.column.status"): status_label(x["status"]),
+                    t("submissions.column.score"): score_text(x),
+                    t("submissions.column.time"): x.get("created_at", ""),
                 }
                 for x in records
             ],
         )
-        selected = st.selectbox("选择提交查看详情", [x["submission_id"] for x in records])
-        st.button("打开提交", on_click=go, args=("提交记录",), kwargs={"_submission_id": selected})
+        selected = st.selectbox(t("submissions.select"), [x["submission_id"] for x in records])
+        st.button(
+            t("submissions.open"),
+            on_click=go,
+            args=("提交记录",),
+            kwargs={"_submission_id": selected},
+        )
     else:
-        st.info("本页暂无提交记录。")
-    with st.expander("通过提交编号查询"):
-        value = st.text_input("提交编号", key="direct_submission_id")
-        if st.button("查询提交详情", disabled=not value.strip()):
+        st.info(t("submissions.empty"))
+    with st.expander(t("submissions.direct")):
+        value = st.text_input(t("submissions.direct_id"), key="direct_submission_id")
+        if st.button(t("submissions.direct_detail"), disabled=not value.strip()):
             go("提交记录", _submission_id=value.strip())
             st.rerun()
-        if st.button("查询公开日志", disabled=not value.strip()):
+        if st.button(t("submissions.direct_log"), disabled=not value.strip()):
             ok, data = mutation("GET", f"/api/submissions/{resource(value.strip())}/log")
             if ok:
                 render_log(data)

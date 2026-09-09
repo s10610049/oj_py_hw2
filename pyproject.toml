@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml",
     "streamlit",
     "uvicorn",
+    "reportlab>=4.4,<5",
 ]
 
 [dependency-groups]

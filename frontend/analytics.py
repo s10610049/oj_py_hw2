@@ -8,6 +8,7 @@ running Streamlit server.
 
 from __future__ import annotations
 
+import base64
 import html
 import math
 from datetime import date
@@ -16,6 +17,7 @@ from typing import Any, Mapping
 import streamlit as st
 
 from frontend.common import api
+from frontend.metadata_i18n import localized_tags
 from shared.taxonomy import difficulty_from_id
 
 SCHEMA_VERSION = "oj.learning-stats.v1"
@@ -56,6 +58,8 @@ _COPY = {
         "timeline_title": "累计最佳得分折线图",
         "timeline_desc": "共 {count} 个日期的数据，从 {first} 到 {last}。",
         "tooltip": "{date}，累计 {score} 分，提交 {submissions} 次",
+        "translation_missing_title": "题目译名暂缺",
+        "translation_missing_tags": "{count} 个知识点译名暂缺",
     },
     "en": {
         "title": "Learning analytics",
@@ -90,6 +94,8 @@ _COPY = {
         "timeline_title": "Cumulative best score line chart",
         "timeline_desc": "{count} dates from {first} to {last}.",
         "tooltip": "{date}: {score} cumulative points, {submissions} submissions",
+        "translation_missing_title": "Translation unavailable",
+        "translation_missing_tags": "{count} untranslated topics",
     },
 }
 
@@ -246,6 +252,7 @@ def normalize_stats(payload: Any, locale: str = "zh-CN") -> dict[str, Any] | Non
     locale = _locale_code(locale)
     if not isinstance(payload, Mapping) or payload.get("schema_version") != SCHEMA_VERSION:
         return None
+    copy = _COPY[locale]
 
     issues = 0
     scope_raw = payload.get("scope")
@@ -336,9 +343,15 @@ def normalize_stats(payload: Any, locale: str = "zh-CN") -> dict[str, Any] | Non
         if not tag or None in {row_attempted, row_passed, earned, available}:
             issues += 1
             continue
+        localized, missing = localized_tags([tag], locale)
+        display_tag = (
+            localized[0]
+            if localized
+            else copy["translation_missing_tags"].format(count=missing or 1)
+        )
         knowledge.append(
             {
-                "tag": tag,
+                "tag": display_tag,
                 "attempted": row_attempted,
                 "passed": row_passed,
                 "earned": earned,
@@ -352,13 +365,19 @@ def normalize_stats(payload: Any, locale: str = "zh-CN") -> dict[str, Any] | Non
     seen_problem_ids = set()
     for raw in _list_of_mappings(payload.get("problems")):
         problem_id = _text(raw.get("problem_id"))
-        title = _text(raw.get("title"))
+        raw_title = _text(raw.get("title"))
+        display_title = _text(raw.get("display_title"))
+        title = (
+            raw_title
+            if locale == "zh-CN"
+            else display_title or f"{problem_id} · {copy['translation_missing_title']}"
+        )
         state = raw.get("state")
         best_score = _number(raw.get("best_score"))
         available_score = _number(raw.get("available_score"))
         if (
             not problem_id
-            or not title
+            or not raw_title
             or state not in STATE_ORDER
             or best_score is None
             or available_score is None
@@ -373,10 +392,14 @@ def normalize_stats(payload: Any, locale: str = "zh-CN") -> dict[str, Any] | Non
         raw_tags = raw.get("tags")
         tags = []
         if isinstance(raw_tags, list):
+            source_tags = []
             for candidate in raw_tags:
                 tag = _text(candidate)
-                if tag and tag.casefold() not in {item.casefold() for item in tags}:
-                    tags.append(tag)
+                if tag and tag.casefold() not in {item.casefold() for item in source_tags}:
+                    source_tags.append(tag)
+            tags, missing_tags = localized_tags(source_tags, locale)
+            if missing_tags:
+                tags.append(copy["translation_missing_tags"].format(count=missing_tags))
         elif raw_tags is not None:
             issues += 1
         problems.append(
@@ -519,10 +542,21 @@ def timeline_svg(timeline: Any, locale: str = "zh-CN") -> str:
     first, last = rows[0]["date"], rows[-1]["date"]
     description = copy["timeline_desc"].format(count=len(rows), first=first, last=last)
     max_label = _format_number(actual_max)
-    return (
-        "<div class='oj-chart oj-timeline' role='region' "
-        f"aria-label='{html.escape(copy['timeline'])}'>"
-        f"<svg viewBox='0 0 {width} {height}' role='img' preserveAspectRatio='xMidYMid meet' "
+    if len(rows) == 1:
+        date_labels = (
+            f"<text class='oj-timeline-date-label' x='{left + plot_width / 2:.2f}' "
+            f"y='{height - 10}' text-anchor='middle'>{html.escape(first)}</text>"
+        )
+    else:
+        date_labels = (
+            f"<text class='oj-timeline-date-label' x='{left}' y='{height - 10}'>"
+            f"{html.escape(first)}</text>"
+            f"<text class='oj-timeline-date-label' x='{width - right}' y='{height - 10}' "
+            f"text-anchor='end'>{html.escape(last)}</text>"
+        )
+    svg = (
+        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {width} {height}' role='img' "
+        "preserveAspectRatio='xMidYMid meet' "
         "width='100%' height='240' "
         "aria-labelledby='oj-timeline-title oj-timeline-desc'>"
         f"<title id='oj-timeline-title'>{html.escape(copy['timeline_title'])}</title>"
@@ -532,13 +566,32 @@ def timeline_svg(timeline: Any, locale: str = "zh-CN") -> str:
         f"<path class='oj-timeline-area' d='{area_path}' fill='#e9f4ef'/>"
         f"<path class='oj-timeline-line' d='{line_path}' fill='none' stroke='#187a55' "
         "stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/>"
-        f"<g class='oj-timeline-points' fill='#187a55'>{circles}</g>"
-        f"<g class='oj-timeline-axis' aria-hidden='true'><text x='{left - 8}' y='{top + 5}' "
+        f"<g class='oj-timeline-points' fill='#187a55' stroke='#ffffff' "
+        f"stroke-width='2'>{circles}</g>"
+        f"<g class='oj-timeline-axis' fill='#6e756f' font-size='11' "
+        f"font-family='Noto Sans SC, system-ui, sans-serif' aria-hidden='true'>"
+        f"<text x='{left - 8}' y='{top + 5}' "
         f"text-anchor='end'>{html.escape(max_label)}</text>"
         f"<text x='{left - 8}' y='{baseline + 4}' text-anchor='end'>0</text>"
-        f"<text x='{left}' y='{height - 10}'>{html.escape(first)}</text>"
-        f"<text x='{width - right}' y='{height - 10}' text-anchor='end'>{html.escape(last)}</text>"
-        "</g></svg></div>"
+        f"{date_labels}"
+        "</g></svg>"
+    )
+    # Streamlit's st.html sanitizer currently removes inline SVG children. Keep
+    # the semantic SVG for direct consumers and add an equivalent data-image
+    # fallback so the real app still renders the complete 240px chart. The
+    # fallback is hidden whenever the browser retains the inline SVG.
+    encoded_svg = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return (
+        "<div class='oj-chart oj-timeline' role='region' "
+        "aria-labelledby='oj-timeline-region-title oj-timeline-region-desc'>"
+        f"<span class='oj-sr-only' id='oj-timeline-region-title'>"
+        f"{html.escape(copy['timeline_title'])}</span>"
+        f"<span class='oj-sr-only' id='oj-timeline-region-desc'>"
+        f"{html.escape(description)}</span>"
+        f"<template class='oj-timeline-source'>{svg}</template>"
+        f"<img class='oj-timeline-image' "
+        f"src='data:image/svg+xml;base64,{encoded_svg}' "
+        f"alt='{html.escape(description)}'></div>"
     )
 
 
@@ -694,7 +747,7 @@ def analytics_page() -> None:
     copy = _COPY[locale]
     st.title(copy["title"])
     st.caption(copy["caption"])
-    payload = api().request("GET", "/api/me/learning-stats/")
+    payload = api().request("GET", "/api/me/learning-stats/", params={"locale": locale})
     fragments = dashboard_fragments(payload, locale)
     if fragments is None:
         st.error(copy["invalid"])

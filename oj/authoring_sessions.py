@@ -40,8 +40,10 @@ MAX_REQUIREMENT_CHARS = 20_000
 MAX_FREE_PROMPT_CHARS = 10_000
 MAX_IMPROVEMENT_CHARS = 10_000
 MAX_PROMPT_BYTES = 100_000
+MAX_TASK_STATE_BYTES = 5 * 1024 * 1024
 MAX_KNOWLEDGE_POINTS = 50
 MAX_ATTACHMENTS = 8
+DEFAULT_PERSISTENCE_POLL_SECONDS = 0.1
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -104,6 +106,14 @@ def _key_digest(owner_id: str, key: str) -> str:
 def _expected_revision(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise APIError(400, "Invalid expected_revision")
+    return value
+
+
+def _optional_base_revision(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise APIError(400, "Invalid base_revision")
     return value
 
 
@@ -222,6 +232,17 @@ def _normalize_task(value: Any, *, expected_task_id: str | None = None) -> dict[
     if status == "completed" and result is None:
         raise APIError(502, "AI task completed without a result")
     progress = value.get("progress", "")
+    progress_percent = value.get("progress_percent")
+    if progress_percent is None:
+        progress_percent = 100 if status == "completed" else 5 if status == "pending" else 10
+    if (
+        isinstance(progress_percent, bool)
+        or not isinstance(progress_percent, int)
+        or not 0 <= progress_percent <= 100
+        or (status == "completed" and progress_percent != 100)
+        or (status != "completed" and progress_percent >= 100)
+    ):
+        raise APIError(502, "AI task returned invalid state")
     error = value.get("error")
     error_code = value.get("error_code")
     error_detail = value.get("error_detail")
@@ -253,6 +274,7 @@ def _normalize_task(value: Any, *, expected_task_id: str | None = None) -> dict[
         "task_id": task_id,
         "status": status,
         "progress": progress or "",
+        "progress_percent": progress_percent,
         "result": copy.deepcopy(dict(result)) if result is not None else None,
         "error": error,
         "error_code": error_code,
@@ -263,9 +285,41 @@ def _normalize_task(value: Any, *, expected_task_id: str | None = None) -> dict[
         "elapsed_seconds": float(elapsed),
     }
     encoded = _canonical_json(task, status=502, message="AI task returned invalid state")
-    if len(encoded.encode("utf-8")) > 600_000:
+    # ``check_generated`` may append up to roughly 2 MiB of bounded generated
+    # inputs and reference answers to a provider response that is itself capped
+    # at 2 MiB.  Keep the persistence consumer above that producer contract,
+    # while retaining a finite per-revision ceiling.
+    if len(encoded.encode("utf-8")) > MAX_TASK_STATE_BYTES:
         raise APIError(502, "AI task state exceeds the size limit")
     return task
+
+
+def _bind_completed_result_to_request(
+    task: Mapping[str, Any], request: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Make the selected canonical difficulty authoritative on completed drafts.
+
+    The provider may translate, omit, or invent the free-form ``difficulty``
+    field.  The user's taxonomy selection is already validated in the revision
+    request, so every successful producer result is projected back to that
+    immutable value before it is persisted or returned.
+    """
+
+    normalized = copy.deepcopy(dict(task))
+    if normalized.get("status") != "completed":
+        return normalized
+    difficulty = request.get("difficulty") if isinstance(request, Mapping) else None
+    difficulty_id = difficulty.get("id") if isinstance(difficulty, Mapping) else None
+    canonical = difficulty_by_id(difficulty_id) if isinstance(difficulty_id, str) else None
+    if canonical is None or difficulty.get("zh-CN") != canonical["zh-CN"]:
+        raise APIError(500, "Authoring revision difficulty is unavailable")
+    result = normalized.get("result")
+    if not isinstance(result, Mapping):
+        raise APIError(502, "AI task completed without a result")
+    projected = copy.deepcopy(dict(result))
+    projected["difficulty"] = str(canonical["zh-CN"])
+    normalized["result"] = projected
+    return normalized
 
 
 def _prompt(
@@ -274,6 +328,7 @@ def _prompt(
     operation: str,
     request: Mapping[str, Any],
     improvement: str | None = None,
+    base_revision: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     original = request if session is None else session["original_request"]
     payload: dict[str, Any] = {
@@ -286,10 +341,29 @@ def _prompt(
     if operation == "replace_requirements":
         instruction = "请按更新后的要求重新完整命题，同时保留未被更新内容否定的原始意图。"
     elif operation == "refine_draft":
-        if session is None or session.get("latest_success_revision") is None:
+        if session is None:
             raise APIError(409, "No successful draft is available")
-        successful = session["revisions"][session["latest_success_revision"] - 1]
-        payload["latest_successful_draft"] = successful["task"]["result"]
+        if base_revision is None:
+            base_revision = session.get("latest_success_revision")
+        if not isinstance(base_revision, int) or not 1 <= base_revision <= len(
+            session["revisions"]
+        ):
+            raise APIError(409, "Selected base revision is not a successful draft")
+        successful = session["revisions"][base_revision - 1]
+        if (
+            successful.get("revision") != base_revision
+            or successful.get("task", {}).get("status") != "completed"
+            or not isinstance(successful.get("task", {}).get("result"), Mapping)
+        ):
+            raise APIError(409, "Selected base revision is not a successful draft")
+        successful_task = _bind_completed_result_to_request(
+            successful["task"], successful["request"]
+        )
+        base_draft = successful_task["result"]
+        payload["base_revision"] = base_revision
+        # Keep this established producer field for compatibility.  Its value
+        # now intentionally means the explicitly selected successful base.
+        payload["latest_successful_draft"] = base_draft
         payload["improvement"] = improvement
         payload["refinement_history"] = [
             {
@@ -317,27 +391,35 @@ def _task_usage(revisions: list[Mapping[str, Any]]) -> dict[str, Any]:
         "incomplete": any(bool(usage.get("incomplete", False)) for usage in usages),
     }
     for field in ("input_tokens", "output_tokens", "total_tokens"):
-        values = [usage.get(field) for usage in usages]
-        if any(
-            value is None or isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in values
-        ):
-            result[field] = None
-        else:
-            result[field] = sum(values)
+        values = []
+        for usage in usages:
+            value = usage.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                result["incomplete"] = True
+                continue
+            values.append(value)
+        # Active revisions may not have provider usage yet. Preserve the
+        # completed revisions' known totals as an explicit approximate lower
+        # bound instead of erasing them and letting the UI display only the
+        # current prompt estimate.
+        result[field] = sum(values) if values else None
     costs = [usage.get("cost") for usage in usages]
     try:
-        if any(
-            value is None
-            or isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-            for value in costs
-        ):
-            raise InvalidOperation
-        total = sum((Decimal(str(value)) for value in costs), Decimal(0))
-        result["cost"] = min(float(total), sys.float_info.max)
+        known_costs = []
+        for value in costs:
+            if (
+                value is None
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                result["incomplete"] = True
+                continue
+            known_costs.append(Decimal(str(value)))
+        result["cost"] = (
+            min(float(sum(known_costs, Decimal(0))), sys.float_info.max) if known_costs else None
+        )
     except (InvalidOperation, ValueError, OverflowError):
         result["cost"] = None
         result["incomplete"] = True
@@ -362,15 +444,26 @@ class AuthoringSessionService:
         cancel_task: CancelTask,
         clock: Callable[[], str] | None = None,
         id_factory: Callable[[], str] | None = None,
+        persistence_poll_seconds: float = DEFAULT_PERSISTENCE_POLL_SECONDS,
     ):
+        if (
+            isinstance(persistence_poll_seconds, bool)
+            or not isinstance(persistence_poll_seconds, (int, float))
+            or not math.isfinite(persistence_poll_seconds)
+            or persistence_poll_seconds <= 0
+        ):
+            raise ValueError("persistence_poll_seconds must be a positive finite number")
         self.store = store
         self.start_task = start_task
         self.get_task = get_task
         self.cancel_task = cancel_task
         self.clock = clock or _now
         self.id_factory = id_factory or (lambda: uuid.uuid4().hex)
+        self._persistence_poll_seconds = float(persistence_poll_seconds)
         self._create_lock = asyncio.Lock()
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._persistence_tasks: dict[tuple[str, int, str], asyncio.Task[None]] = {}
+        self._closing = False
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -406,7 +499,18 @@ class AuthoringSessionService:
         return revision_number, session["revisions"][revision_number - 1]["task"]["result"]
 
     def _public(self, session: Mapping[str, Any]) -> dict[str, Any]:
-        revision_number, draft = self._latest_success(session)
+        revision_number, _ = self._latest_success(session)
+        revisions = copy.deepcopy(session["revisions"])
+        for revision in revisions:
+            task = revision.get("task") if isinstance(revision, Mapping) else None
+            request = revision.get("request") if isinstance(revision, Mapping) else None
+            if isinstance(task, Mapping) and isinstance(request, Mapping):
+                revision["task"] = _bind_completed_result_to_request(task, request)
+        draft = (
+            revisions[revision_number - 1]["task"]["result"]
+            if revision_number is not None
+            else None
+        )
         return copy.deepcopy(
             {
                 "schema_version": SESSION_SCHEMA,
@@ -420,7 +524,7 @@ class AuthoringSessionService:
                 "draft": draft,
                 "original_request": session["original_request"],
                 "current_request": session["current_request"],
-                "revisions": session["revisions"],
+                "revisions": revisions,
                 "cumulative_usage": _task_usage(session["revisions"]),
             }
         )
@@ -456,7 +560,169 @@ class AuthoringSessionService:
     @staticmethod
     def _mark_success(session: dict[str, Any], revision: Mapping[str, Any]) -> None:
         if revision["task"]["status"] == "completed":
-            session["latest_success_revision"] = revision["revision"]
+            previous = session.get("latest_success_revision")
+            if not isinstance(previous, int) or revision["revision"] > previous:
+                session["latest_success_revision"] = revision["revision"]
+
+    @staticmethod
+    def _persistence_key(session_id: str, revision: Mapping[str, Any]) -> tuple[str, int, str]:
+        return session_id, int(revision["revision"]), str(revision["task"]["task_id"])
+
+    def _ensure_persistence_task(
+        self,
+        session_id: str,
+        owner_id: str,
+        revision: Mapping[str, Any],
+    ) -> None:
+        """Track an active revision until its provider state is durable.
+
+        The persisted revision number and task id form the compare key.  The
+        tracker never writes the session snapshot it originally received, so a
+        delayed observation from an old revision cannot erase newer history.
+        """
+
+        if self._closing or revision["task"]["status"] not in ACTIVE_TASK_STATUSES:
+            return
+        key = self._persistence_key(session_id, revision)
+        existing = self._persistence_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._track_revision(session_id, owner_id, key[1], key[2]),
+            name=f"authoring-persistence:{session_id}:{key[1]}",
+        )
+        self._persistence_tasks[key] = task
+        task.add_done_callback(
+            lambda completed, task_key=key: self._tracking_done(task_key, completed)
+        )
+
+    def _tracking_done(
+        self,
+        key: tuple[str, int, str],
+        completed: asyncio.Task[None],
+    ) -> None:
+        if self._persistence_tasks.get(key) is completed:
+            self._persistence_tasks.pop(key, None)
+        if not completed.cancelled():
+            # Retrieve an unexpected exception so a background observer can
+            # never produce an unhandled-task warning.  Expected dependency
+            # errors are contained inside _track_revision.
+            completed.exception()
+
+    async def _merge_observed_task(
+        self,
+        session_id: str,
+        owner_id: str,
+        revision_number: int,
+        task_id: str,
+        fresh: Mapping[str, Any],
+    ) -> bool:
+        """Merge one provider snapshot and report whether tracking should continue."""
+
+        async with self._lock(session_id):
+            session = await self._load(session_id, owner_id)
+            if not 1 <= revision_number <= len(session["revisions"]):
+                return False
+            revision = session["revisions"][revision_number - 1]
+            if revision.get("revision") != revision_number:
+                return False
+            current = revision.get("task")
+            if not isinstance(current, Mapping) or current.get("task_id") != task_id:
+                return False
+            # A terminal provider state is immutable.  In particular, a stale
+            # running read must not resurrect a revision cancelled by a newer
+            # request while this observer was waiting for the session lock.
+            if current.get("status") not in ACTIVE_TASK_STATUSES:
+                return False
+            normalized = _bind_completed_result_to_request(fresh, revision["request"])
+            if normalized["status"] in ACTIVE_TASK_STATUSES:
+                # Explicit client polling owns live-progress persistence.  The
+                # supervisor writes only terminal snapshots, avoiding a SQLite
+                # write every time elapsed_seconds changes.
+                return True
+            revision["task"] = normalized
+            timestamp = self.clock()
+            revision["updated_at"] = timestamp
+            session["updated_at"] = timestamp
+            self._mark_success(session, revision)
+            await self.store.put(SESSION_NAMESPACE, session_id, session)
+            return False
+
+    async def _observe_revision_once(
+        self,
+        session_id: str,
+        owner_id: str,
+        revision_number: int,
+        task_id: str,
+    ) -> bool:
+        fresh = _normalize_task(
+            await self.get_task(task_id, owner_id),
+            expected_task_id=task_id,
+        )
+        return await self._merge_observed_task(
+            session_id,
+            owner_id,
+            revision_number,
+            task_id,
+            fresh,
+        )
+
+    async def _track_revision(
+        self,
+        session_id: str,
+        owner_id: str,
+        revision_number: int,
+        task_id: str,
+    ) -> None:
+        """Poll an ephemeral provider task until its latest state is persistent."""
+
+        try:
+            while True:
+                await asyncio.sleep(self._persistence_poll_seconds)
+                try:
+                    if not await self._observe_revision_once(
+                        session_id,
+                        owner_id,
+                        revision_number,
+                        task_id,
+                    ):
+                        return
+                except APIError as error:
+                    # A missing/foreign task cannot become observable again in
+                    # this process.  Other provider contract failures remain
+                    # visible through explicit poll() and are retried here.
+                    if error.status in {403, 404}:
+                        return
+                except Exception:
+                    # Persistence supervision must not take down the request
+                    # task.  A later observation can still make the state
+                    # durable after a transient callback/store failure.
+                    continue
+        except asyncio.CancelledError:
+            # If shutdown arrives after the provider has already completed,
+            # make one shielded final observation before yielding cancellation.
+            try:
+                await asyncio.shield(
+                    self._observe_revision_once(
+                        session_id,
+                        owner_id,
+                        revision_number,
+                        task_id,
+                    )
+                )
+            except Exception:
+                pass
+            raise
+
+    async def close(self) -> None:
+        """Flush observable terminal states before the ephemeral AI service closes."""
+
+        self._closing = True
+        tasks = [task for task in self._persistence_tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _compensate_started(self, task: Mapping[str, Any], owner_id: str) -> None:
         if task["status"] not in ACTIVE_TASK_STATUSES:
@@ -485,17 +751,23 @@ class AuthoringSessionService:
                 if not isinstance(existing, Mapping) or existing.get("fingerprint") != fingerprint:
                     raise APIError(409, "Idempotency key was already used")
                 session = await self._load(str(existing.get("session_id")), owner_id)
+                self._ensure_persistence_task(
+                    session["session_id"], owner_id, session["revisions"][-1]
+                )
                 return self._public(session)
             session_id = self._validate_session_id(self.id_factory())
             if await self.store.get(SESSION_NAMESPACE, session_id) is not None:
                 raise APIError(500, "Authoring session id collision")
-            started = _normalize_task(
-                await self.start_task(
-                    owner_id,
-                    prompt,
-                    tuple(copy.deepcopy(normalized["attachments"])),
-                    normalized["reference_problem_id"],
-                )
+            started = _bind_completed_result_to_request(
+                _normalize_task(
+                    await self.start_task(
+                        owner_id,
+                        prompt,
+                        tuple(copy.deepcopy(normalized["attachments"])),
+                        normalized["reference_problem_id"],
+                    )
+                ),
+                normalized,
             )
             timestamp = self.clock()
             revision = self._revision(
@@ -538,21 +810,30 @@ class AuthoringSessionService:
             except Exception:
                 await self._compensate_started(started, owner_id)
                 raise
+            self._ensure_persistence_task(session_id, owner_id, revision)
+            # Let the supervisor enter its cancellation-safe loop before this
+            # API call can be immediately followed by application shutdown.
+            await asyncio.sleep(0)
             return self._public(session)
 
     async def get(self, session_id: str, owner_id: str) -> dict[str, Any]:
         session_id, owner_id = self._validate_session_id(session_id), _owner(owner_id)
         async with self._lock(session_id):
-            return self._public(await self._load(session_id, owner_id))
+            session = await self._load(session_id, owner_id)
+            self._ensure_persistence_task(session_id, owner_id, session["revisions"][-1])
+            return self._public(session)
 
     async def _sync_current(self, session: dict[str, Any]) -> bool:
         revision = session["revisions"][-1]
         current = revision["task"]
         if current["status"] not in ACTIVE_TASK_STATUSES:
             return False
-        fresh = _normalize_task(
-            await self.get_task(current["task_id"], session["owner_id"]),
-            expected_task_id=current["task_id"],
+        fresh = _bind_completed_result_to_request(
+            _normalize_task(
+                await self.get_task(current["task_id"], session["owner_id"]),
+                expected_task_id=current["task_id"],
+            ),
+            revision["request"],
         )
         if fresh == current:
             return False
@@ -569,6 +850,7 @@ class AuthoringSessionService:
             session = await self._load(session_id, owner_id)
             if await self._sync_current(session):
                 await self.store.put(SESSION_NAMESPACE, session_id, session)
+            self._ensure_persistence_task(session_id, owner_id, session["revisions"][-1])
             return self._public(session)
 
     @staticmethod
@@ -586,16 +868,22 @@ class AuthoringSessionService:
         if current["status"] not in ACTIVE_TASK_STATUSES:
             return
         try:
-            cancelled = _normalize_task(
-                await self.cancel_task(current["task_id"], session["owner_id"]),
-                expected_task_id=current["task_id"],
+            cancelled = _bind_completed_result_to_request(
+                _normalize_task(
+                    await self.cancel_task(current["task_id"], session["owner_id"]),
+                    expected_task_id=current["task_id"],
+                ),
+                revision["request"],
             )
         except APIError as error:
             if error.status != 409:
                 raise
-            cancelled = _normalize_task(
-                await self.get_task(current["task_id"], session["owner_id"]),
-                expected_task_id=current["task_id"],
+            cancelled = _bind_completed_result_to_request(
+                _normalize_task(
+                    await self.get_task(current["task_id"], session["owner_id"]),
+                    expected_task_id=current["task_id"],
+                ),
+                revision["request"],
             )
             if cancelled["status"] in ACTIVE_TASK_STATUSES:
                 raise error
@@ -616,8 +904,12 @@ class AuthoringSessionService:
         expected_revision: int,
         key_hash: str,
         fingerprint: str,
+        base_revision: int | None = None,
     ) -> dict[str, Any]:
         if self._idempotent_revision(session, key_hash, fingerprint):
+            self._ensure_persistence_task(
+                session["session_id"], session["owner_id"], session["revisions"][-1]
+            )
             return self._public(session)
         if session["current_revision"] != expected_revision:
             raise APIError(409, "Authoring session revision conflict")
@@ -628,21 +920,25 @@ class AuthoringSessionService:
             operation=operation,
             request=request,
             improvement=improvement,
+            base_revision=base_revision,
         )
         await self._cancel_current(session)
-        started = _normalize_task(
-            await self.start_task(
-                session["owner_id"],
-                prompt,
-                tuple(copy.deepcopy(request["attachments"])),
-                request["reference_problem_id"],
-            )
+        started = _bind_completed_result_to_request(
+            _normalize_task(
+                await self.start_task(
+                    session["owner_id"],
+                    prompt,
+                    tuple(copy.deepcopy(request["attachments"])),
+                    request["reference_problem_id"],
+                )
+            ),
+            request,
         )
         number = expected_revision + 1
         timestamp = self.clock()
         revision = self._revision(
             number=number,
-            parent=expected_revision,
+            parent=base_revision if operation == "refine_draft" else expected_revision,
             operation=operation,
             request=request,
             improvement=improvement,
@@ -664,6 +960,8 @@ class AuthoringSessionService:
         except Exception:
             await self._compensate_started(started, session["owner_id"])
             raise
+        self._ensure_persistence_task(session["session_id"], session["owner_id"], revision)
+        await asyncio.sleep(0)
         return self._public(session)
 
     async def replace_requirements(
@@ -700,6 +998,7 @@ class AuthoringSessionService:
         *,
         expected_revision: int,
         idempotency_key: str,
+        base_revision: int | None = None,
     ) -> dict[str, Any]:
         session_id, owner_id = self._validate_session_id(session_id), _owner(owner_id)
         async with self._lock(session_id):
@@ -711,26 +1010,51 @@ class AuthoringSessionService:
                 required=True,
             )
             expected = _expected_revision(expected_revision)
+            requested_base = _optional_base_revision(base_revision)
             key_hash = _key_digest(owner_id, _idempotency_key(idempotency_key))
+            fingerprint_payload = {"improvement": normalized_improvement}
+            if requested_base is not None:
+                fingerprint_payload["base_revision"] = requested_base
             fingerprint = self._fingerprint(
-                "refine_draft", expected, {"improvement": normalized_improvement}
+                "refine_draft",
+                expected,
+                fingerprint_payload,
             )
             if self._idempotent_revision(session, key_hash, fingerprint):
+                self._ensure_persistence_task(session_id, owner_id, session["revisions"][-1])
                 return self._public(session)
             if session["current_revision"] != expected:
                 raise APIError(409, "Authoring session revision conflict")
             if await self._sync_current(session):
                 await self.store.put(SESSION_NAMESPACE, session_id, session)
-            if session.get("latest_success_revision") is None:
+            selected_base = (
+                requested_base
+                if requested_base is not None
+                else session.get("latest_success_revision")
+            )
+            if not isinstance(selected_base, int) or not 1 <= selected_base <= len(
+                session["revisions"]
+            ):
                 raise APIError(409, "No successful draft is available")
+            base = session["revisions"][selected_base - 1]
+            if (
+                base.get("revision") != selected_base
+                or base.get("task", {}).get("status") != "completed"
+                or not isinstance(base.get("task", {}).get("result"), Mapping)
+            ):
+                raise APIError(409, "Selected base revision is not a successful draft")
             return await self._append(
                 session,
                 operation="refine_draft",
-                request=session["current_request"],
+                # A historical branch inherits the request and immutable
+                # attachment references that produced its selected base, not
+                # unrelated requirement edits from a later branch.
+                request=base["request"],
                 improvement=normalized_improvement,
                 expected_revision=expected,
                 key_hash=key_hash,
                 fingerprint=fingerprint,
+                base_revision=selected_base,
             )
 
     async def cancel_active(self, session_id: str, owner_id: str) -> dict[str, Any]:

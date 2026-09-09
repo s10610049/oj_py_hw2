@@ -1,8 +1,8 @@
-"""Stable difficulty taxonomy and display-only localization helpers.
+"""Stable difficulty taxonomy, localization and explicit legacy migrations.
 
-The stored course ``difficulty`` field remains free text.  Only exact labels in
-this registry are normalized; legacy values such as ``medium`` or ``基础`` are
-deliberately left neutral instead of being guessed into a Luogu level.
+The public course field remains a string, while new authoring uses canonical
+Luogu labels.  Historical values are migrated only through the versioned,
+auditable mapping below; unknown custom values are never guessed.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any
 
 TAXONOMY_VERSION = "luogu-2026-09.v1"
+LEGACY_MIGRATION_VERSION = "legacy-to-luogu-2026-09.v1"
 
 DIFFICULTIES = (
     {
@@ -76,6 +77,18 @@ _BY_EXACT_LABEL = {
     str(item[label]).casefold(): item for item in DIFFICULTIES for label in ("zh-CN", "en")
 }
 
+# Product decision R-044.  These mappings cover the project's former three-tier
+# labels plus their exact English counterparts.  Do not add fuzzy aliases here:
+# a new historical value needs an explicit reviewed migration.
+LEGACY_DIFFICULTY_MIGRATIONS = {
+    "easy": "luogu.1",
+    "基础": "luogu.2",
+    "medium": "luogu.4",
+    "进阶": "luogu.4",
+    "hard": "luogu.5",
+    "困难": "luogu.5",
+}
+
 
 def difficulty_by_id(difficulty_id: str) -> Mapping[str, Any] | None:
     """Return immutable registry data by canonical id, or ``None``."""
@@ -83,13 +96,29 @@ def difficulty_by_id(difficulty_id: str) -> Mapping[str, Any] | None:
     return _BY_ID.get(str(difficulty_id))
 
 
+def migrated_difficulty_label(raw: str) -> str | None:
+    """Return the canonical Chinese label for one exact historical value."""
+
+    text = str(raw or "").strip()
+    difficulty_id = LEGACY_DIFFICULTY_MIGRATIONS.get(text.casefold())
+    if difficulty_id is None:
+        difficulty_id = LEGACY_DIFFICULTY_MIGRATIONS.get(text)
+    item = _BY_ID.get(difficulty_id) if difficulty_id else None
+    return str(item["zh-CN"]) if item is not None else None
+
+
 def normalize_difficulty(raw: str, locale: str = "zh-CN") -> dict[str, Any]:
-    """Normalize only registered exact labels into a safe display projection."""
+    """Normalize canonical labels and explicitly mapped historical labels."""
 
     if locale not in {"zh-CN", "en"}:
         raise ValueError("unsupported locale")
     text = str(raw or "").strip()
     item = _BY_EXACT_LABEL.get(text.casefold())
+    if item is None:
+        migration_id = LEGACY_DIFFICULTY_MIGRATIONS.get(text.casefold())
+        if migration_id is None:
+            migration_id = LEGACY_DIFFICULTY_MIGRATIONS.get(text)
+        item = _BY_ID.get(migration_id) if migration_id else None
     if item is None:
         return {
             "id": None,

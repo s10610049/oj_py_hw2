@@ -21,9 +21,20 @@ from starlette.requests import ClientDisconnect
 
 from oj.authoring_adapter import AuthoringTaskAdapter
 from oj.authoring_sessions import AuthoringSessionService
-from oj.chat import ChatError, ProgrammingChatService, build_programming_context
+from oj.chat import (
+    ChatError,
+    ProgrammingChatService,
+    build_programming_context,
+    build_programming_focus,
+    localize_programming_context,
+    prepare_programming_focus,
+)
 from oj.common import APIError, response
-from oj.progress import build_progress_payloads, problem_version_digest
+from oj.progress import (
+    build_admin_learning_overview,
+    build_progress_payloads,
+    problem_version_digest,
+)
 from oj.schemas import identifier, paginate, pagination, text_field, validate_problem
 from oj.store import Store
 from oj.translations import (
@@ -35,7 +46,12 @@ from oj.translations import (
     validate_translation,
 )
 from shared.knowledge import KNOWLEDGE_CATEGORIES, KNOWLEDGE_POINTS, KNOWLEDGE_VERSION
-from shared.taxonomy import DIFFICULTIES, TAXONOMY_VERSION, normalize_difficulty
+from shared.taxonomy import (
+    DIFFICULTIES,
+    TAXONOMY_VERSION,
+    migrated_difficulty_label,
+    normalize_difficulty,
+)
 
 COOKIE = "oj_session"
 SESSION_SECONDS = 24 * 3600
@@ -144,6 +160,40 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             if not await store.get("languages", language["name"]):
                 await store.put("languages", language["name"], language)
 
+        # R-044: migrate the project's former three-tier labels to the current
+        # Luogu taxonomy.  Difficulty is display metadata, so submissions that
+        # exactly matched the old problem version move to the equivalent new
+        # digest; already-outdated or unknown versions stay historical.
+        snapshot = await store.snapshot("problems", "submissions")
+        problem_updates = []
+        current_version_updates = {}
+        for problem in snapshot["problems"]:
+            canonical = migrated_difficulty_label(problem.get("difficulty", ""))
+            if canonical is None or canonical == problem.get("difficulty"):
+                continue
+            old_digest = problem_version_digest(problem)
+            updated = {**problem, "difficulty": canonical}
+            new_digest = problem_version_digest(updated)
+            problem_updates.append(("problems", problem["id"], updated))
+            current_version_updates[(problem["id"], old_digest)] = (new_digest, canonical)
+
+        submission_updates = []
+        for submission in snapshot["submissions"]:
+            updated = None
+            version_update = current_version_updates.get(
+                (submission.get("problem_id"), submission.get("problem_version"))
+            )
+            if version_update is not None:
+                updated = {**submission, "problem_version": version_update[0]}
+            canonical_snapshot = migrated_difficulty_label(submission.get("difficulty_raw", ""))
+            if canonical_snapshot is not None:
+                updated = {**(updated or submission), "difficulty_raw": canonical_snapshot}
+            if updated is not None:
+                submission_updates.append(("submissions", submission["submission_id"], updated))
+
+        if problem_updates or submission_updates:
+            await store.write_batch(puts=[*problem_updates, *submission_updates])
+
     async def cancel_jobs():
         running = list(jobs.values())
         for task in running:
@@ -187,6 +237,7 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
         yield
         await cancel_jobs()
         await application.state.chat.close()
+        await application.state.authoring.close()
         await application.state.ai.close()
 
     application = FastAPI(title="OJ · 编程练习室", version="1.0.0", lifespan=lifespan)
@@ -723,8 +774,7 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             ]
         )
 
-    async def personal_progress(user):
-        snapshot = await store.snapshot("problems", "submissions")
+    def progress_from_snapshot(snapshot, user):
         try:
             return build_progress_payloads(
                 snapshot["problems"],
@@ -738,15 +788,59 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             # expose raw stored documents, code or hidden cases.
             raise APIError(500, "Learning progress could not be calculated") from None
 
+    async def personal_progress(user):
+        snapshot = await store.snapshot("problems", "submissions")
+        return progress_from_snapshot(snapshot, user)
+
+    def localize_statistics_titles(snapshot, statistics, locale):
+        """Add a safe display title without changing version-sensitive facts."""
+
+        translations = {
+            item.get("problem_id"): item
+            for item in snapshot.get("problem_translations", [])
+            if item.get("locale") == "en"
+        }
+        problems_by_id = {problem.get("id"): problem for problem in snapshot.get("problems", [])}
+        for row in statistics.get("problems", []):
+            problem = problems_by_id.get(row.get("problem_id"))
+            if problem is None:
+                continue
+            content = localized_content(problem, locale, translations.get(problem.get("id")))
+            ready = content.get("status") == "ready" and content.get("resolved_locale") == locale
+            fields = content.get("fields") if isinstance(content.get("fields"), dict) else {}
+            row["display_title"] = str(fields.get("title", "")) if ready else None
+            row["title_translation_status"] = str(content.get("status", "missing"))
+        statistics["display_locale"] = locale
+        return statistics
+
     @application.get("/api/me/problem-statuses/")
     async def personal_problem_statuses(user=Depends(current_user)):
         statuses, _ = await personal_progress(user)
         return response(statuses)
 
     @application.get("/api/me/learning-stats/")
-    async def personal_learning_stats(user=Depends(current_user)):
-        _, statistics = await personal_progress(user)
-        return response(statistics)
+    async def personal_learning_stats(request: Request, user=Depends(current_user)):
+        locale = normalize_locale(request.query_params.get("locale"))
+        snapshot = await store.snapshot("problems", "submissions", "problem_translations")
+        _, statistics = progress_from_snapshot(snapshot, user)
+        return response(localize_statistics_titles(snapshot, statistics, locale))
+
+    @application.get("/api/admin/learning-overview/")
+    async def admin_learning_overview(user=Depends(administrator)):
+        snapshot = await store.snapshot("users", "problems", "submissions")
+        try:
+            overview = build_admin_learning_overview(
+                snapshot["users"],
+                snapshot["problems"],
+                snapshot["submissions"],
+                difficulty_normalizer=normalize_difficulty,
+                generated_at=now(),
+            )
+        except (TypeError, ValueError, KeyError, OverflowError):
+            # Keep malformed aggregate data behind the same fail-closed privacy
+            # boundary as the personal statistics endpoints.
+            raise APIError(500, "Administrator overview could not be calculated") from None
+        return response(overview)
 
     @application.post("/api/problems/")
     async def add_problem(request: Request, user=Depends(current_user)):
@@ -1172,6 +1266,7 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
                 improvement,
                 expected_revision=value.get("expected_revision"),
                 idempotency_key=value.get("idempotency_key"),
+                base_revision=value.get("base_revision"),
             )
         )
 
@@ -1210,18 +1305,76 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
     @application.post("/api/chat/sessions/{session_id}/turns/")
     async def create_chat_turn(session_id: str, request: Request, user=Depends(current_user)):
         value = await body_object(request)
-        statuses, statistics = await personal_progress(user)
-        context = build_programming_context(statuses, statistics)
-        return response(
-            await application.state.chat.create_turn(
-                session_id,
-                user["user_id"],
-                value.get("message"),
-                expected_context_epoch=value.get("expected_context_epoch"),
-                context=context,
-                config=application.state.ai.private_config(user["user_id"]),
-                idempotency_key=value.get("idempotency_key"),
+        prepared_focus, focus_digest = prepare_programming_focus(value.get("focus"))
+        replayed = await application.state.chat.replay_turn(
+            session_id,
+            user["user_id"],
+            value.get("message"),
+            expected_context_epoch=value.get("expected_context_epoch"),
+            idempotency_key=value.get("idempotency_key"),
+            focus_digest=focus_digest,
+        )
+        if replayed is not None:
+            return response(replayed)
+
+        chat_session = await application.state.chat.get_session(session_id, user["user_id"])
+        chat_locale = chat_session.get("locale", "zh-CN")
+        translation_snapshot = (
+            await store.all("problem_translations") if chat_locale == "en" else []
+        )
+
+        # Build one coherent progress/focus handoff.  The final comparison is
+        # made while holding the same lock used by problem/submission writers,
+        # closing the last race before the turn is accepted.  A single retry
+        # absorbs an in-flight judge completion without spinning indefinitely.
+        for attempt in range(2):
+            snapshot = await store.snapshot("problems", "submissions")
+            statuses, statistics = progress_from_snapshot(snapshot, user)
+            context = build_programming_context(statuses, statistics)
+            context = localize_programming_context(
+                context,
+                snapshot["problems"],
+                translation_snapshot,
+                chat_locale,
             )
+            focus = build_programming_focus(
+                prepared_focus,
+                focus_digest,
+                snapshot["problems"],
+                snapshot["submissions"],
+                user["user_id"],
+                locale=chat_locale,
+                translations=translation_snapshot,
+            )
+            async with mutation:
+                latest = await store.snapshot("problems", "submissions")
+                latest_statuses, _ = progress_from_snapshot(latest, user)
+                if latest_statuses["context_epoch"] != statuses["context_epoch"]:
+                    if attempt == 0:
+                        continue
+                    raise ChatError(
+                        409,
+                        "学习进度正在更新，请刷新后重新发送",
+                        "context_epoch_mismatch",
+                        retryable=True,
+                    )
+                turn = await application.state.chat.create_turn(
+                    session_id,
+                    user["user_id"],
+                    value.get("message"),
+                    expected_context_epoch=value.get("expected_context_epoch"),
+                    context=context,
+                    config=application.state.ai.private_config(user["user_id"]),
+                    idempotency_key=value.get("idempotency_key"),
+                    focus=focus,
+                )
+                return response(turn)
+
+        raise ChatError(
+            409,
+            "学习进度正在更新，请刷新后重新发送",
+            "context_epoch_mismatch",
+            retryable=True,
         )
 
     async def owned_chat_turn(session_id, turn_id, user):
@@ -1243,6 +1396,7 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
     async def reset(user=Depends(administrator)):
         await cancel_jobs()
         await application.state.chat.close()
+        await application.state.authoring.close()
         await application.state.ai.close()
         async with mutation:
             await store.clear()

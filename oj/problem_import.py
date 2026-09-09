@@ -15,7 +15,9 @@ import math
 import re
 from typing import Any
 
+from oj.common import APIError
 from oj.safe_archive import ArchiveMember, SafeArchiveError, read_safe_zip
+from oj.translations import validate_translation
 
 SCHEMA_VERSION = "oj.problem-import-preview.v1"
 NATIVE_SCHEMA = "oj.problem-archive.v1"
@@ -501,6 +503,8 @@ def _parse_luogu_config(
         _error("CONFIG_INVALID", "config.yml cases must be a list.", "config.yml.cases")
     observed_times: set[int | float] = set()
     observed_memories: set[int] = set()
+    explicit_time_limits = 0
+    explicit_memory_limits = 0
     seen_inputs: set[str] = set()
     for index, raw_case in enumerate(raw_cases):
         case = _object(raw_case, f"config.yml.cases[{index}]")
@@ -536,8 +540,10 @@ def _parse_luogu_config(
         case_memory = _config_memory(case, prefix=f"cases[{index}].")
         if case_time is not None:
             observed_times.add(case_time)
+            explicit_time_limits += 1
         if case_memory is not None:
             observed_memories.add(case_memory)
+            explicit_memory_limits += 1
     if len(observed_times) > 1 or (
         global_time is not None and observed_times and observed_times != {global_time}
     ):
@@ -552,6 +558,18 @@ def _parse_luogu_config(
         _error(
             "UNSUPPORTED_HETEROGENEOUS_LIMITS",
             "Per-case memory limits must be identical.",
+            "memory_limit",
+        )
+    if global_time is None and observed_times and explicit_time_limits != len(known_pairs):
+        _error(
+            "UNSUPPORTED_PARTIAL_CASE_LIMITS",
+            "A per-case time limit can only be promoted when every case defines it.",
+            "time_limit",
+        )
+    if global_memory is None and observed_memories and explicit_memory_limits != len(known_pairs):
+        _error(
+            "UNSUPPORTED_PARTIAL_CASE_LIMITS",
+            "A per-case memory limit can only be promoted when every case defines it.",
             "memory_limit",
         )
     return global_time or next(iter(observed_times), None), global_memory or next(
@@ -582,9 +600,26 @@ def _metadata_problem(
         "samples",
         "time_limit",
         "memory_limit",
+        "translations",
     }
     if set(metadata) - allowed:
         _error("METADATA_FIELD_UNSUPPORTED", "Problem metadata has an unsupported field.")
+    if "translations" in metadata:
+        translations = metadata["translations"]
+        if not isinstance(translations, Mapping) or set(translations) != {"en"}:
+            _error(
+                "METADATA_TRANSLATION_INVALID",
+                "English problem metadata must be complete.",
+                "translations.en",
+            )
+        try:
+            metadata["translations"] = {"en": validate_translation(translations["en"])}
+        except APIError:
+            _error(
+                "METADATA_TRANSLATION_INVALID",
+                "English problem metadata must be complete English text.",
+                "translations.en",
+            )
     required = (
         "id",
         "title",

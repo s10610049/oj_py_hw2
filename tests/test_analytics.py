@@ -159,6 +159,17 @@ def test_timeline_svg_has_finite_bounded_geometry_and_accessible_text():
     assert "M 54.00 131.23 L 742.00 18.00" in rendered
 
 
+def test_single_point_timeline_centers_one_date_axis_label():
+    source = payload()
+    source["timeline"] = [source["timeline"][0]]
+
+    result = analytics.normalize_stats(source)
+    rendered = analytics.timeline_svg(result["timeline"])
+
+    assert rendered.count("class='oj-timeline-date-label'") == 1
+    assert "x='398.00' y='230' text-anchor='middle'>2026-09-09</text>" in rendered
+
+
 def test_empty_payload_renders_zero_kpis_and_meaningful_empty_states():
     source = payload()
     source["scope"]["catalog_problem_count"] = 0
@@ -290,8 +301,8 @@ def test_analytics_page_uses_one_backend_payload(monkeypatch):
     output = []
 
     class Client:
-        def request(self, method, path):
-            requests.append((method, path))
+        def request(self, method, path, params=None):
+            requests.append((method, path, params))
             return payload()
 
     monkeypatch.setattr(analytics, "api", lambda: Client())
@@ -305,7 +316,7 @@ def test_analytics_page_uses_one_backend_payload(monkeypatch):
 
     analytics.analytics_page()
 
-    assert requests == [("GET", "/api/me/learning-stats/")]
+    assert requests == [("GET", "/api/me/learning-stats/", {"locale": "zh-CN"})]
     assert any("oj-analytics-kpis" in item for item in output)
     assert any("oj-analytics-table" in item for item in output)
 
@@ -317,3 +328,20 @@ def test_english_fixed_copy_and_taxonomy_are_consistent():
     assert "Intermediate+ / Provincial−" in fragments["difficulty"]
     assert "部分得分" not in fragments["outcomes"]
     assert "Partially passed" in fragments["problems"]
+    combined = fragments["knowledge"] + fragments["problems"]
+    assert "字符串" not in combined and "动态规划" not in combined and "数组" not in combined
+    assert "Translation unavailable" in fragments["problems"]
+    assert "untranslated topics" in combined
+
+
+def test_english_analytics_uses_backend_display_titles_and_known_topic_translations():
+    source = payload()
+    source["problems"][0]["display_title"] = "Longest common subsequence"
+    source["problems"][1]["display_title"] = "Two sum"
+
+    fragments = analytics.dashboard_fragments(source, "en")
+
+    assert "Longest common subsequence" in fragments["problems"]
+    assert "Two sum" in fragments["problems"]
+    assert "Dynamic programming" in fragments["problems"]
+    assert "Arrays" in fragments["problems"]

@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import math
 import socket
 
 import httpx
@@ -44,7 +45,19 @@ def problem():
         "time_limit": 1.0,
         "memory_limit": 128,
         "reference_solution": "a,b=map(int,input().split()); print(a+b)",
+        "test_generator": "import json\nprint(json.dumps([]))\n",
         "validation_notes": "正负边界已列出；未声称执行验证。",
+        "test_generation_notes": "确定性生成器；本单元测试夹具不增加大数据测试点。",
+        "translations": {
+            "en": {
+                "title": "Integer Sum",
+                "description": "Compute the sum of two integers.",
+                "input_description": "Read two integers a and b.",
+                "output_description": "Print a + b.",
+                "constraints": "Both integers are between -100 and 100.",
+                "hint": "Use integer addition.",
+            }
+        },
     }
 
 
@@ -203,6 +216,47 @@ async def test_generated_complete_english_statement_is_preserved(services, confi
     assert final["status"] == "completed"
     assert final["result"]["translations"]["en"]["title"] == "Integer Sum"
     assert all(case in final["result"]["testcases"] for case in problem["testcases"])
+
+
+@pytest.mark.asyncio
+async def test_missing_validation_note_gets_truthful_checked_fallback(services, config, problem):
+    candidate = copy.deepcopy(problem)
+    candidate.pop("validation_notes")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return response(stream_bytes(candidate))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "生成可审阅的完整题目"))
+
+    assert final["status"] == "completed"
+    assert final["provider_calls"] == 1
+    assert len(requests) == 1
+    assert "系统已实际运行参考解" in final["result"]["validation_notes"]
+    assert "人工审阅" in final["result"]["validation_notes"]
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_translation_enters_bounded_repair(services, config, problem):
+    legacy = copy.deepcopy(problem)
+    legacy.pop("translations")
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return response(stream_bytes(legacy if len(requests) == 1 else problem))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "生成完整双语题目"))
+
+    assert final["status"] == "completed"
+    assert final["result"]["translations"]["en"]["title"] == "Integer Sum"
+    assert len(requests) == 2
+    feedback = requests[1]["messages"][-1]["content"]
+    assert "authoring_check:problem_translation" in feedback
+    assert "translations.en" in feedback
 
 
 @pytest.mark.asyncio
@@ -444,10 +498,52 @@ async def test_partial_provider_usage_remains_partial(services, config, problem)
     body += event({"choices": [], "usage": {"total_tokens": 77}}) + b"data: [DONE]\n\n"
     service = services(config, lambda _: response(body))
     usage = (await finished(service, await service.start("alice", "求和")))["usage"]
-    assert usage["source"] == "provider_partial" and usage["total_tokens"] == 77
-    assert usage["input_tokens"] is None and usage["cost"] > 0
-    assert usage["cost_basis"] == "conservative_total_tokens"
+    assert usage["source"] == "provider_partial"
+    assert usage["input_tokens"] > 0 and usage["output_tokens"] > 0
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+    assert usage["total_tokens"] >= 77
+    assert usage["provider_reported_total_tokens"] == 77
+    assert set(usage["estimated_fields"]) >= {"input_tokens", "output_tokens"}
+    assert usage["cost"] > 0 and usage["cost_basis"] == "input_output_tokens"
+    assert "UTF-8" in usage["note"]
     assert usage["incomplete"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_usage", "exact_field", "exact_value", "estimated_field"),
+    [
+        ({"prompt_tokens": 11}, "input_tokens", 11, "output_tokens"),
+        ({"completion_tokens": 7}, "output_tokens", 7, "input_tokens"),
+        (
+            {"prompt_tokens": 11, "total_tokens": 13},
+            "input_tokens",
+            11,
+            "output_tokens",
+        ),
+    ],
+)
+async def test_partial_provider_usage_fills_missing_components_from_payload(
+    services,
+    config,
+    problem,
+    provider_usage,
+    exact_field,
+    exact_value,
+    estimated_field,
+):
+    encoded = json.dumps(problem)
+    body = delta(encoded, "stop")
+    body += event({"choices": [], "usage": provider_usage}) + b"data: [DONE]\n\n"
+    service = services(config, lambda _: response(body))
+    usage = (await finished(service, await service.start("alice", "求和")))["usage"]
+
+    assert usage[exact_field] == exact_value
+    assert usage[estimated_field] >= math.ceil(len(encoded.encode()) / 3)
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+    assert estimated_field in usage["estimated_fields"]
+    assert usage["source"] == "provider_partial" and usage["incomplete"]
+    assert usage["cost"] > 0
 
 
 @pytest.mark.asyncio
@@ -549,6 +645,55 @@ async def test_invalid_model_responses_fail_closed(services, config, problem, ki
     assert final["status"] == "failed" and final["result"] is None
     assert final["error"] and config["api_key"] not in json.dumps(final)
     assert final["error_code"] and final["usage"]["cost"] is not None
+
+
+@pytest.mark.asyncio
+async def test_truncated_provider_output_retries_with_concise_full_request(
+    services, config, problem
+):
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            return response(delta('{"id":"partial', "length"))
+        return response(stream_bytes(problem))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "生成完整题目"))
+
+    assert final["status"] == "completed"
+    assert final["provider_calls"] == 2
+    assert len(requests) == 2
+    retry = requests[1]["messages"][-1]
+    assert retry["role"] == "user"
+    assert "输出长度限制" in retry["content"]
+    assert "partial" not in retry["content"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_reference_runtime_failure_uses_fresh_final_design(
+    services, config, problem
+):
+    broken = copy.deepcopy(problem)
+    broken["reference_solution"] = "raise ValueError('broken candidate')"
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        candidate = broken if len(requests) < 3 else problem
+        return response(stream_bytes(candidate))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "生成可靠题目"))
+
+    assert final["status"] == "completed"
+    assert final["provider_calls"] == 3
+    assert len(requests[1]["messages"]) == 4
+    assert len(requests[2]["messages"]) == 3
+    fresh_messages = json.dumps(requests[2]["messages"], ensure_ascii=False)
+    assert "不要复用前稿" in fresh_messages
+    assert "broken candidate" not in fresh_messages
 
 
 @pytest.mark.asyncio
@@ -738,6 +883,48 @@ async def test_json_and_schema_candidates_enter_targeted_repair(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["test_generator", "test_generation_notes"])
+async def test_missing_generator_contract_enters_bounded_repair(services, config, problem, missing):
+    incomplete = copy.deepcopy(problem)
+    incomplete.pop(missing)
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return response(stream_bytes(incomplete if len(requests) == 1 else problem))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+
+    assert final["status"] == "completed" and final["provider_calls"] == 2
+    feedback = requests[1]["messages"][-1]["content"]
+    assert "authoring_check:problem_schema" in feedback
+    assert "test_generator" in feedback and "test_generation_notes" in feedback
+    assert final["result"][missing]
+
+
+@pytest.mark.asyncio
+async def test_persistently_missing_generator_contract_fails_structurally(
+    services, config, problem
+):
+    incomplete = copy.deepcopy(problem)
+    incomplete.pop("test_generator")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response(stream_bytes(incomplete))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+
+    assert len(calls) == 3
+    assert final["status"] == "failed" and final["result"] is None
+    assert final["error_code"] == "authoring_validation_exhausted"
+    assert final["error_detail"] == "authoring_check:problem_schema"
+
+
+@pytest.mark.asyncio
 async def test_exact_deadlock_requirement_repairs_generator_output_and_runs_full_gate(
     services, config
 ):
@@ -806,6 +993,21 @@ print(json.dumps(inputs))
         "test_generator": valid_generator,
         "validation_notes": "使用拓扑排序判断是否存在未被移除的节点。",
         "test_generation_notes": "覆盖有环与多层汇合的无环图，预期复杂度O(n+m)。",
+        "translations": {
+            "en": {
+                "title": "Lock Dependency Cycle Detection",
+                "description": (
+                    "Model thread lock dependencies as a directed graph and detect a cycle."
+                ),
+                "input_description": (
+                    "The first line contains n and m. Each following line u v means "
+                    "thread u waits for thread v."
+                ),
+                "output_description": "Print YES when a directed cycle exists; otherwise NO.",
+                "constraints": "1 <= n <= 200000, 0 <= m <= 300000",
+                "hint": "Use topological sorting or directed-cycle detection.",
+            }
+        },
     }
     broken = copy.deepcopy(valid)
     broken["test_generator"] = 'print("not-json")\n'
@@ -829,7 +1031,90 @@ print(json.dumps(inputs))
 
 
 @pytest.mark.asyncio
-async def test_failed_consistency_never_returns_problem_or_retries_forever(
+async def test_persistently_invalid_generator_uses_reviewable_deterministic_fallback(
+    services, config, problem
+):
+    broken = copy.deepcopy(problem)
+    broken["test_generator"] = 'print("not-json")\n'
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return response(stream_bytes(broken))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+
+    assert len(calls) == 3
+    assert final["status"] == "completed" and final["provider_calls"] == 3
+    assert final["result"]["quality"]["reference_checked"] is True
+    assert final["result"]["quality"]["generated_cases"] == len(problem["testcases"])
+    assert "系统安全回退" in final["result"]["test_generation_notes"]
+    assert 'print("not-json")' not in final["result"]["test_generator"]
+
+
+@pytest.mark.asyncio
+async def test_generator_and_literal_answer_fallbacks_compose_after_bounded_retries(
+    services, config, problem
+):
+    broken = copy.deepcopy(problem)
+    broken["test_generator"] = 'print("not-json")\n'
+    broken["testcases"][0]["output"] = "999\n"
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response(stream_bytes(broken))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+
+    assert len(calls) == 3
+    assert final["status"] == "completed" and final["provider_calls"] == 3
+    assert final["result"]["testcases"][0]["output"].strip() == "0"
+    assert "系统安全回退" in final["result"]["test_generation_notes"]
+    assert "系统一致性回退" in final["result"]["validation_notes"]
+    assert final["result"]["quality"]["reference_checked"] is True
+
+
+@pytest.mark.asyncio
+async def test_generator_fallback_discards_one_unexecutable_hidden_literal(
+    services, config, problem
+):
+    broken = copy.deepcopy(problem)
+    broken["reference_solution"] = (
+        "import sys\n"
+        "value = int(sys.stdin.read())\n"
+        "if value == 13:\n"
+        "    raise ValueError()\n"
+        "print(value * 2)\n"
+    )
+    broken["samples"] = [{"input": "1\n", "output": "2\n"}]
+    broken["testcases"] = [
+        {"input": "1\n", "output": "2\n"},
+        {"input": "2\n", "output": "4\n"},
+        {"input": "3\n", "output": "6\n"},
+        {"input": "13\n", "output": "26\n"},
+    ]
+    broken["test_generator"] = 'print("not-json")\n'
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response(stream_bytes(broken))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "边界求和"))
+
+    assert len(calls) == 3
+    assert final["status"] == "completed" and final["provider_calls"] == 3
+    assert "13\n" not in {case["input"] for case in final["result"]["testcases"]}
+    assert "单个测例" in final["result"]["validation_notes"]
+    assert final["result"]["quality"]["reference_checked"] is True
+
+
+@pytest.mark.asyncio
+async def test_repeated_answer_mismatch_uses_reviewable_materialization_fallback(
     services, config, problem
 ):
     problem["testcases"][0]["output"] = "999"
@@ -842,11 +1127,11 @@ async def test_failed_consistency_never_returns_problem_or_retries_forever(
     service = services(config, handler)
     final = await finished(service, await service.start("alice", "整数求和"))
     assert len(calls) == 3
-    assert final["status"] == "failed" and final["result"] is None
-    assert "一致性" in final["error"]
-    assert final["error_code"] == "authoring_validation_exhausted"
-    assert final["retryable"] and "调整需求" not in final["error"]
-    assert final["error_detail"] == "authoring_check:answer_mismatch:case=1"
+    assert final["status"] == "completed" and final["error"] is None
+    assert final["result"]["testcases"][0]["output"].strip() == "0"
+    assert final["result"]["samples"][0]["output"].strip() == "3"
+    assert "系统一致性回退" in final["result"]["validation_notes"]
+    assert final["result"]["quality"]["reference_checked"] is True
     assert final["provider_calls"] == 3
     assert final["usage"]["total_tokens"] == 4500
     assert final["usage"]["cost"] == pytest.approx(0.018)
@@ -906,7 +1191,7 @@ async def test_opt_in_candidate_evidence_excludes_configuration(
         config, lambda _: response(stream_bytes(problem)), evidence_directory=tmp_path
     )
     final = await finished(service, await service.start("alice", "整数求和"))
-    assert final["status"] == "failed"
+    assert final["status"] == "completed"
     artifacts = list(tmp_path.glob("*.json"))
     assert len(artifacts) == 3
     for path in artifacts:

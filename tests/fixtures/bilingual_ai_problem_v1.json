@@ -1,0 +1,34 @@
+{
+  "id": "AI-GOLDEN-001",
+  "title": "整数求和",
+  "description": "计算两个整数的和。",
+  "input_description": "输入一行两个整数 a 和 b。",
+  "output_description": "输出一个整数 a+b。",
+  "constraints": "-100 <= a,b <= 100",
+  "hint": "直接进行整数加法。",
+  "source": "AI生成",
+  "author": "AI",
+  "difficulty": "入门",
+  "tags": ["整数运算"],
+  "samples": [
+    {"input": "1 2\n", "output": "3\n"}
+  ],
+  "testcases": [
+    {"input": "1 2\n", "output": "3\n"},
+    {"input": "-100 100\n", "output": "0\n"}
+  ],
+  "time_limit": 1.0,
+  "memory_limit": 128,
+  "reference_solution": "a, b = map(int, input().split())\nprint(a + b)\n",
+  "validation_notes": "Boundary values are included for human review.",
+  "translations": {
+    "en": {
+      "title": "Integer Sum",
+      "description": "Compute the sum of two integers.",
+      "input_description": "Read two integers a and b from one line.",
+      "output_description": "Print the integer a+b.",
+      "constraints": "-100 <= a,b <= 100",
+      "hint": "Use integer addition directly."
+    }
+  }
+}

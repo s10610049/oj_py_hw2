@@ -170,9 +170,34 @@ def _classification(result: ProcessResult, *, compile_stage: bool = False) -> st
 
 
 def _message(text: str, directory: Path) -> str:
-    return text.replace(str(directory), "[submission]").replace(
-        directory.as_posix(), "[submission]"
-    )[:MESSAGE_LIMIT]
+    """Remove host paths while retaining useful traceback locations."""
+
+    runner = Path(__file__).with_name("python_runner.py").resolve()
+    runner_directory = runner.parent
+    project_root = runner_directory.parent
+    substitutions = (
+        (runner, "[runner]/python_runner.py"),
+        (directory.resolve(), "[submission]"),
+        (runner_directory, "[runner]"),
+        (project_root, "[runner]"),
+    )
+    sanitized = str(text)
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    for path, replacement in substitutions:
+        variants = sorted({str(path), path.as_posix()}, key=len, reverse=True)
+        for variant in variants:
+            sanitized = re.sub(
+                re.escape(variant), lambda _match: replacement, sanitized, flags=flags
+            )
+
+    # A neutral placeholder is part of the public contract; normalize only the
+    # placeholder-qualified paths so source snippets and escape sequences stay intact.
+    sanitized = re.sub(
+        r"\[(runner|submission)\](?:[\\/][^\"\r\n]*)?",
+        lambda match: match.group(0).replace("\\", "/"),
+        sanitized,
+    )
+    return sanitized[:MESSAGE_LIMIT]
 
 
 async def judge_submission(problem: dict, language: dict, code: str) -> dict:

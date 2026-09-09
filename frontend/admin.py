@@ -1,27 +1,63 @@
 """Administrative workspace shares the same API permissions and visual system."""
 
+from collections.abc import Mapping
+
 import streamlit as st
 
 from frontend.accounts import users_page
+from frontend.admin_analytics import admin_overview_page
 from frontend.common import api, data_table, go, is_admin
+from frontend.i18n import t
+
+
+def audit_table_rows(records, locale_code=None):
+    result = []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, Mapping):
+            continue
+        action = record.get("action", "")
+        action_label = (
+            t("admin.audit_action.view_logs", locale_code)
+            if action == "view_logs"
+            else t("admin.audit_action.other", locale_code)
+        )
+        result.append(
+            {
+                t("admin.audit_column.user", locale_code): record.get("user_id", ""),
+                t("admin.audit_column.problem", locale_code): record.get("problem_id", ""),
+                t("admin.audit_column.action", locale_code): action_label,
+                t("admin.audit_column.time", locale_code): record.get("time", ""),
+                t("admin.audit_column.status", locale_code): record.get("status", ""),
+            }
+        )
+    return result
 
 
 def admin_page():
     if not is_admin():
-        st.error("此页面仅对管理员开放。")
+        st.error(t("admin.forbidden"))
         return
-    st.title("管理工作区")
-    users, audit, links = st.tabs(["用户与权限", "日志访问审计", "题目与评测"])
+    st.title(t("admin.title"))
+    overview, users, audit, links = st.tabs(
+        [
+            t("admin.tab.overview"),
+            t("admin.tab.users"),
+            t("admin.tab.audit"),
+            t("admin.tab.judge"),
+        ]
+    )
+    with overview:
+        admin_overview_page()
     with users:
         users_page()
     with audit:
-        st.subheader("日志访问审计")
+        st.subheader(t("admin.tab.audit"))
         with st.form("audit_filters", border=False):
             a, b = st.columns(2)
-            owner = a.text_input("访问用户编号（可选）")
-            problem = b.text_input("日志题号（可选）")
-            page = st.number_input("审计页码", min_value=1, value=1, step=1)
-            submitted = st.form_submit_button("查询访问记录")
+            owner = a.text_input(t("admin.audit_owner"))
+            problem = b.text_input(t("admin.audit_problem"))
+            page = st.number_input(t("admin.audit_page"), min_value=1, value=1, step=1)
+            submitted = st.form_submit_button(t("admin.audit_query"))
         if submitted:
             params = {"page": page, "page_size": 50}
             if owner.strip():
@@ -30,12 +66,20 @@ def admin_page():
                 params["problem_id"] = problem.strip()
             records = api().request("GET", "/api/logs/access/", params=params)
             if records:
-                data_table(records)
+                data_table(audit_table_rows(records))
             else:
-                st.info("没有匹配的访问记录。")
+                st.info(t("admin.audit_empty"))
     with links:
-        st.write("题目删除与日志可见性在题目详情的管理区操作。重新评测在提交详情中操作。")
-        st.button("管理题库", on_click=go, args=("题库",), kwargs={"_problem_mode": "list"})
+        st.write(t("admin.judge_note"))
         st.button(
-            "查询与重新评测", on_click=go, args=("提交记录",), kwargs={"_submission_id": None}
+            t("admin.manage_problems"),
+            on_click=go,
+            args=("题库",),
+            kwargs={"_problem_mode": "list"},
+        )
+        st.button(
+            t("admin.manage_rejudge"),
+            on_click=go,
+            args=("提交记录",),
+            kwargs={"_submission_id": None},
         )

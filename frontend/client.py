@@ -1,5 +1,6 @@
 """One HTTP client and cookie jar per Streamlit session."""
 
+from collections.abc import Mapping
 import os
 from urllib.parse import quote
 
@@ -9,9 +10,11 @@ import httpx
 class APIError(Exception):
     """Safe error for presentation; never contains response bodies or credentials."""
 
-    def __init__(self, status, message):
+    def __init__(self, status, message, *, error_code=None, retryable=None):
         self.status = status
         self.message = message
+        self.error_code = error_code if isinstance(error_code, str) else None
+        self.retryable = retryable if isinstance(retryable, bool) else None
         super().__init__(message)
 
 
@@ -61,6 +64,9 @@ class APIClient:
             raise APIError(502, "服务响应格式不符合约定，请联系管理员。")
         if response.status_code != 200:
             message = body["msg"]
+            data = body.get("data")
+            error_code = data.get("error_code") if isinstance(data, Mapping) else None
+            retryable = data.get("retryable") if isinstance(data, Mapping) else None
             if isinstance(json, dict):
                 for field in ("password", "api_key"):
                     secret = json.get(field)
@@ -68,7 +74,12 @@ class APIClient:
                         message = message.replace(str(secret), "[已隐藏]")
             if response.status_code == 401:
                 self.http.cookies.clear()
-            raise APIError(response.status_code, message[:400])
+            raise APIError(
+                response.status_code,
+                message[:400],
+                error_code=error_code,
+                retryable=retryable,
+            )
         return body["data"]
 
     def close(self):

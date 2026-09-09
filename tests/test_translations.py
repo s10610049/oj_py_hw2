@@ -58,6 +58,7 @@ def test_translation_requires_every_prose_field_and_rejects_judge_fields():
     assert set(validate_translation(english())) == set(TRANSLATABLE_FIELDS)
     for value in (
         {**english(), "description": ""},
+        {**english(), "description": "Add 两个 integers."},
         {**english(), "testcases": []},
         {key: value for key, value in english().items() if key != "title"},
     ):
@@ -103,13 +104,13 @@ def test_ready_translation_is_complete_and_secret_free():
     assert "SECRET_REFERENCE" not in rendered
 
 
-def test_missing_and_stale_records_fall_back_as_one_language_not_mixed():
+def test_missing_and_stale_records_fail_closed_without_mixing_languages():
     source = problem()
     missing = localized_content(source, "en")
     assert missing["status"] == "missing"
-    assert missing["fallback"] is True
-    assert missing["resolved_locale"] == "zh-CN"
-    assert missing["fields"] == {field: source[field] for field in TRANSLATABLE_FIELDS}
+    assert missing["fallback"] is False
+    assert missing["resolved_locale"] is None
+    assert missing["fields"] == {field: "" for field in TRANSLATABLE_FIELDS}
 
     record = make_translation_record(
         source,
@@ -120,12 +121,12 @@ def test_missing_and_stale_records_fall_back_as_one_language_not_mixed():
     changed = {**source, "title": "新的标题"}
     stale = localized_content(changed, "en", record)
     assert stale["status"] == "stale"
-    assert stale["fallback"] is True
-    assert stale["fields"]["title"] == "新的标题"
-    assert all(stale["fields"][field] == changed[field] for field in TRANSLATABLE_FIELDS)
+    assert stale["fallback"] is False
+    assert stale["resolved_locale"] is None
+    assert stale["fields"] == {field: "" for field in TRANSLATABLE_FIELDS}
 
 
-def test_corrupt_persisted_record_fails_closed_to_canonical_content():
+def test_corrupt_persisted_record_fails_closed_to_empty_english_content():
     source = problem()
     record = make_translation_record(
         source,
@@ -138,8 +139,9 @@ def test_corrupt_persisted_record_fails_closed_to_canonical_content():
     content = localized_content(source, "en", record)
 
     assert content["status"] == "missing"
-    assert content["fallback"] is True
-    assert content["fields"]["title"] == source["title"]
+    assert content["fallback"] is False
+    assert content["resolved_locale"] is None
+    assert content["fields"] == {field: "" for field in TRANSLATABLE_FIELDS}
 
 
 def test_embedded_translation_is_additive_and_strict():
