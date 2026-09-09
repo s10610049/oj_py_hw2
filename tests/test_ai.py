@@ -210,6 +210,8 @@ async def test_no_config_and_invalid_input(services):
         {"api_key": False},
         {"input_price": -1},
         {"input_price": float("nan")},
+        {"input_price": 10**400},
+        {"output_price": 10**400},
         {"output_price": True},
         {"price_unit": 0},
         {"price_unit": True},

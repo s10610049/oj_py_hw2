@@ -69,6 +69,21 @@ random.seed(42)，在所有函数定义之前；不能把random.seed放在函数
 控制篇幅，优先完成完整有效的题面和测试数据。"""
 
 
+def _contains_secret(value, secret):
+    """Inspect decoded strings, including JSON-escaped quotes and backslashes."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str) and secret in item:
+            return True
+        if isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
 def _public_ip(address):
     try:
         parsed = ipaddress.ip_address(address)
@@ -130,12 +145,17 @@ def _config(value):
     normalized["currency"] = currency.upper()
     for key in ("input_price", "output_price"):
         value_number = value.get(key)
-        if value_number is not None and (
-            type(value_number) not in (int, float)
-            or not math.isfinite(value_number)
-            or value_number < 0
-        ):
-            raise APIError(400, f"Invalid {key}")
+        if value_number is not None:
+            try:
+                valid = (
+                    type(value_number) in (int, float)
+                    and math.isfinite(value_number)
+                    and value_number >= 0
+                )
+            except OverflowError:
+                valid = False
+            if not valid:
+                raise APIError(400, f"Invalid {key}")
         normalized[key] = value_number
     return normalized
 
@@ -355,6 +375,11 @@ class AIService:
         task.progress = "正在连接模型并提交命题需求"
         try:
             result = await asyncio.wait_for(self._author(task), TASK_TIMEOUT_SECONDS)
+            # Reference/generator execution can synthesize strings not present
+            # literally in the provider JSON. Apply the disclosure boundary to
+            # the complete checked artifact, before publishing any result.
+            if _contains_secret(result, task.config["api_key"]):
+                raise APIError(500, "生成结果包含敏感配置，已阻止展示")
             if task.status == "running":
                 task.result = result
                 task.status = "completed"
@@ -486,7 +511,7 @@ class AIService:
                     artifact = json.dumps(
                         {"candidate": candidate, "check": error.message}, ensure_ascii=False
                     )
-                    if task.config["api_key"] not in artifact:
+                    if not _contains_secret(candidate, task.config["api_key"]):
                         try:
                             self._evidence_directory.mkdir(parents=True, exist_ok=True)
                             path = self._evidence_directory / f"{task.task_id}-{attempt + 1}.json"
@@ -578,7 +603,7 @@ class AIService:
             raise APIError(500, "模型响应包含敏感配置，已阻止展示")
         try:
             value = json.loads(task.output)
-            if task.config["api_key"] in json.dumps(value, ensure_ascii=False):
+            if _contains_secret(value, task.config["api_key"]):
                 raise APIError(500, "模型响应包含敏感配置，已阻止展示")
             result = validate_problem(value)
             for name in (
