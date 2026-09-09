@@ -23,10 +23,22 @@ from oj.common import APIError, response
 from oj.progress import build_progress_payloads, problem_version_digest
 from oj.schemas import identifier, paginate, pagination, text_field, validate_problem
 from oj.store import Store
+from oj.translations import (
+    embedded_english_translation,
+    localized_content,
+    make_translation_record,
+    normalize_locale,
+    translation_key,
+    validate_translation,
+)
 from shared.taxonomy import normalize_difficulty
 
 COOKIE = "oj_session"
 SESSION_SECONDS = 24 * 3600
+ATTACHMENT_TTL_SECONDS = 3600
+IMPORT_TTL_SECONDS = 3600
+MAX_JSON_BODY_BYTES = 8_000_000
+MAX_IMPORT_UPLOAD_BYTES = 16 * 1024 * 1024
 
 
 def new_id():
@@ -42,13 +54,17 @@ def password_bytes(password):
     return base64.b64encode(hashlib.sha256(password.encode("utf-8")).digest())
 
 
-async def read_body(request):
+async def read_body(request, maximum=MAX_JSON_BODY_BYTES):
     chunks = bytearray()
     async for chunk in request.stream():
-        if len(chunks) + len(chunk) > 8_000_000:
+        if len(chunks) + len(chunk) > maximum:
             raise APIError(400, "Request body is too large")
         chunks.extend(chunk)
     return bytes(chunks)
+
+
+def expires_at(seconds):
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat(timespec="seconds")
 
 
 async def body_object(request):
@@ -163,7 +179,14 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             # Untrusted/slow uploads must never hold the lifecycle lock. Delay
             # validation errors until AFTER route authentication (401 > 403 > 400).
             try:
-                request.state.buffered_body = await asyncio.wait_for(read_body(request), 10)
+                upload_limits = {
+                    "/api/attachments/": 10 * 1024 * 1024,
+                    "/api/problem-imports/uploads/": MAX_IMPORT_UPLOAD_BYTES,
+                }
+                request.state.buffered_body = await asyncio.wait_for(
+                    read_body(request, upload_limits.get(request.url.path, MAX_JSON_BODY_BYTES)),
+                    10,
+                )
             except APIError as error:
                 request.state.body_error = error
             except (asyncio.TimeoutError, ClientDisconnect):
@@ -179,6 +202,12 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             async with lifecycle:
                 return await call_next(request)
         return await call_next(request)
+
+    async def raw_body(request):
+        if getattr(request.state, "body_error", None):
+            raise request.state.body_error
+        buffered = getattr(request.state, "buffered_body", None)
+        return buffered if buffered is not None else await read_body(request)
 
     @application.exception_handler(APIError)
     async def expected_error(request, exc):
@@ -236,6 +265,33 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             "submit_count": len(submissions),
             "resolve_count": len(resolved),
         }
+
+    def structured_failure(error, *, status=400):
+        data = {"error_code": error.code}
+        field = getattr(error, "field", None)
+        if field is not None:
+            data["field"] = field
+        return response(data, error.message, status)
+
+    async def owned_temporary(namespace, key, owner):
+        record = await store.get(namespace, key)
+        if (
+            not record
+            or record.get("owner") != owner
+            or not isinstance(record.get("expires_epoch"), (int, float))
+            or record["expires_epoch"] <= time.time()
+        ):
+            raise APIError(404, "Temporary resource not found or expired")
+        return record
+
+    async def purge_expired(namespace):
+        current = time.time()
+        for record in await store.all(namespace):
+            if (
+                isinstance(record.get("expires_epoch"), (int, float))
+                and record["expires_epoch"] <= current
+            ):
+                await store.delete(namespace, record["id"])
 
     async def add_user(value, role):
         username, password = credentials(value)
@@ -348,12 +404,291 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             )
         return response({"user_id": user_id, "role": role}, "role updated")
 
+    @application.post("/api/attachments/")
+    async def upload_attachment(request: Request, user=Depends(current_user)):
+        from oj.attachments import AttachmentError, parse_attachment
+
+        filename = text_field(
+            request.query_params.get("filename"), "filename", minimum=1, maximum=255
+        )
+        media_type = request.query_params.get("media_type") or request.headers.get(
+            "content-type", ""
+        )
+        content = await raw_body(request)
+        attachment_id = new_id()
+        created = now()
+        expires = expires_at(ATTACHMENT_TTL_SECONDS)
+        try:
+            parsed = await asyncio.to_thread(
+                parse_attachment,
+                content,
+                filename=filename,
+                media_type=media_type,
+                attachment_id=attachment_id,
+                created_at=created,
+                expires_at=expires,
+                vision_available=False,
+            )
+        except AttachmentError as error:
+            return structured_failure(error)
+        await purge_expired("attachments")
+        await store.put(
+            "attachments",
+            attachment_id,
+            {
+                **parsed.as_dict(),
+                "id": attachment_id,
+                "owner": user["user_id"],
+                "expires_epoch": time.time() + ATTACHMENT_TTL_SECONDS,
+                "extracted_text": parsed.extracted_text,
+            },
+        )
+        return response(parsed.as_dict(), "attachment ready")
+
+    @application.get("/api/attachments/")
+    async def list_attachments(user=Depends(current_user)):
+        records = [
+            record
+            for record in await store.all("attachments")
+            if record.get("owner") == user["user_id"]
+            and record.get("expires_epoch", 0) > time.time()
+        ]
+        records.sort(key=lambda item: (item.get("created_at", ""), item.get("id", "")))
+        private = {"id", "owner", "expires_epoch", "extracted_text"}
+        return response(
+            [{k: v for k, v in record.items() if k not in private} for record in records]
+        )
+
+    @application.get("/api/attachments/{attachment_id}")
+    async def attachment_info(attachment_id: str, user=Depends(current_user)):
+        attachment_id = identifier(attachment_id, "attachment_id")
+        record = await owned_temporary("attachments", attachment_id, user["user_id"])
+        private = {"id", "owner", "expires_epoch", "extracted_text"}
+        return response({k: v for k, v in record.items() if k not in private})
+
+    @application.delete("/api/attachments/{attachment_id}")
+    async def delete_attachment(attachment_id: str, user=Depends(current_user)):
+        attachment_id = identifier(attachment_id, "attachment_id")
+        await owned_temporary("attachments", attachment_id, user["user_id"])
+        await store.delete("attachments", attachment_id)
+        return response({"attachment_id": attachment_id}, "attachment deleted")
+
+    @application.post("/api/problem-imports/uploads/")
+    async def upload_problem_archive(request: Request, user=Depends(current_user)):
+        filename = text_field(
+            request.query_params.get("filename"), "filename", minimum=1, maximum=255
+        )
+        media_type = (
+            (request.query_params.get("media_type") or request.headers.get("content-type", ""))
+            .partition(";")[0]
+            .strip()
+            .casefold()
+        )
+        if not filename.casefold().endswith(".zip") or media_type not in {
+            "application/zip",
+            "application/x-zip-compressed",
+        }:
+            raise APIError(400, "Problem archive must be a ZIP file")
+        content = await raw_body(request)
+        if not content.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+            raise APIError(400, "Problem archive signature is invalid")
+        await purge_expired("problem_import_uploads")
+        upload_id = new_id()
+        created = now()
+        expires = expires_at(IMPORT_TTL_SECONDS)
+        await store.put(
+            "problem_import_uploads",
+            upload_id,
+            {
+                "id": upload_id,
+                "owner": user["user_id"],
+                "filename": filename,
+                "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "created_at": created,
+                "expires_at": expires,
+                "expires_epoch": time.time() + IMPORT_TTL_SECONDS,
+                "raw_base64": base64.b64encode(content).decode("ascii"),
+            },
+        )
+        return response(
+            {
+                "schema_version": "oj.problem-import-upload.v1",
+                "upload_id": upload_id,
+                "filename": filename,
+                "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "created_at": created,
+                "expires_at": expires,
+            },
+            "archive uploaded",
+        )
+
+    @application.post("/api/problem-imports/previews/")
+    async def preview_problem_archive(request: Request, user=Depends(current_user)):
+        from oj.problem_import import ImportError as ProblemImportError
+        from oj.problem_import import parse_problem_archive
+
+        value = await body_object(request)
+        upload_id = identifier(value.get("upload_id"), "upload_id")
+        source_format = text_field(
+            value.get("source_format"), "source_format", minimum=1, maximum=40
+        )
+        metadata = value.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise APIError(400, "Import metadata must be an object")
+        upload = await owned_temporary("problem_import_uploads", upload_id, user["user_id"])
+        try:
+            archive = base64.b64decode(upload["raw_base64"], validate=True)
+        except (KeyError, ValueError):
+            raise APIError(500, "Stored problem archive is unavailable") from None
+        try:
+            if source_format == "luogu-flat-v1":
+                import yaml
+
+                parsed = await asyncio.to_thread(
+                    parse_problem_archive,
+                    archive,
+                    source_format=source_format,
+                    metadata=metadata,
+                    config_loader=yaml.safe_load,
+                )
+            else:
+                parsed = await asyncio.to_thread(
+                    parse_problem_archive,
+                    archive,
+                    source_format=source_format,
+                    metadata=metadata,
+                )
+        except ProblemImportError as error:
+            return structured_failure(error)
+        problem_id = parsed.problem.get("id")
+        existing = await store.get("problems", problem_id) if problem_id else None
+        current_digest = problem_version_digest(existing) if existing else None
+        preview_id = new_id()
+        expiry_epoch = time.time() + IMPORT_TTL_SECONDS
+        expiry = datetime.fromtimestamp(expiry_epoch, timezone.utc).isoformat(timespec="seconds")
+        public_preview = parsed.make_preview(
+            preview_id=preview_id,
+            expires_at=expiry,
+            conflict_exists=existing is not None,
+            current_digest=current_digest,
+        )
+        await purge_expired("problem_import_previews")
+        await store.put(
+            "problem_import_previews",
+            preview_id,
+            {
+                "id": preview_id,
+                "owner": user["user_id"],
+                "upload_id": upload_id,
+                "expires_at": expiry,
+                "expires_epoch": expiry_epoch,
+                "status": "ready",
+                "parsed_can_commit": parsed.can_commit,
+                "problem": dict(parsed.problem),
+                "public_preview": public_preview,
+            },
+        )
+        return response(public_preview, "import preview ready")
+
+    @application.get("/api/problem-imports/previews/{preview_id}")
+    async def problem_import_preview(preview_id: str, user=Depends(current_user)):
+        preview_id = identifier(preview_id, "preview_id")
+        record = await owned_temporary("problem_import_previews", preview_id, user["user_id"])
+        if record.get("status") == "committed":
+            return response(
+                {**record["public_preview"], "status": "committed", "result": record["result"]}
+            )
+        return response(record["public_preview"])
+
+    @application.post("/api/problem-imports/previews/{preview_id}/commit")
+    async def commit_problem_import(preview_id: str, request: Request, user=Depends(current_user)):
+        preview_id = identifier(preview_id, "preview_id")
+        value = await body_object(request)
+        overwrite = value.get("overwrite", False)
+        expected_digest = value.get("expected_digest")
+        if not isinstance(overwrite, bool) or (
+            expected_digest is not None and not isinstance(expected_digest, str)
+        ):
+            raise APIError(400, "Invalid import confirmation")
+        record = await owned_temporary("problem_import_previews", preview_id, user["user_id"])
+        if record.get("status") == "committed":
+            return response(record["result"], "archive already committed")
+        if not record.get("parsed_can_commit"):
+            raise APIError(400, "Import preview has missing required fields")
+        problem = validate_problem(record.get("problem"))
+        embedded = embedded_english_translation(record.get("problem"))
+        async with mutation:
+            existing = await store.get("problems", problem["id"])
+            current_digest = problem_version_digest(existing) if existing else None
+            preview_conflict = record["public_preview"].get("conflict", {})
+            if existing:
+                if not overwrite:
+                    raise APIError(409, "Problem already exists; confirm overwrite")
+                if (
+                    not expected_digest
+                    or expected_digest != preview_conflict.get("current_digest")
+                    or expected_digest != current_digest
+                ):
+                    raise APIError(409, "Problem changed after preview; preview again")
+            elif expected_digest is not None:
+                raise APIError(409, "Problem conflict no longer exists; preview again")
+            stored_problem = {
+                **problem,
+                "public_cases": existing.get("public_cases", False) if existing else False,
+            }
+            result = {
+                "problem_id": problem["id"],
+                "problem_version": problem_version_digest(stored_problem),
+                "created": existing is None,
+                "translation_imported": embedded is not None,
+            }
+            record = {**record, "status": "committed", "result": result}
+            puts = [
+                ("problems", problem["id"], stored_problem),
+                ("problem_import_previews", preview_id, record),
+            ]
+            if embedded is not None:
+                puts.append(
+                    (
+                        "problem_translations",
+                        translation_key(problem["id"]),
+                        make_translation_record(
+                            stored_problem,
+                            embedded,
+                            source="import",
+                            updated_at=now(),
+                        ),
+                    )
+                )
+            await store.write_batch(
+                puts=puts,
+                deletes=[("problem_import_uploads", record["upload_id"])],
+            )
+        return response(result, "problem archive committed")
+
     @application.get("/api/problems/")
-    async def problems(user=Depends(current_user)):
+    async def problems(request: Request, user=Depends(current_user)):
+        locale = normalize_locale(request.query_params.get("locale"))
+        snapshot = await store.snapshot("problems", "problem_translations")
+        translations = {
+            item.get("problem_id"): item
+            for item in snapshot["problem_translations"]
+            if item.get("locale") == "en"
+        }
         return response(
             [
-                {k: p.get(k, "") for k in ("id", "title", "difficulty", "tags", "source")}
-                for p in await store.all("problems")
+                {
+                    **{
+                        key: problem.get(key, "")
+                        for key in ("id", "title", "difficulty", "tags", "source")
+                    },
+                    "content": localized_content(
+                        problem, locale, translations.get(problem.get("id"))
+                    ),
+                }
+                for problem in snapshot["problems"]
             ]
         )
 
@@ -384,42 +719,100 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
 
     @application.post("/api/problems/")
     async def add_problem(request: Request, user=Depends(current_user)):
-        problem = validate_problem(await body_object(request))
+        value = await body_object(request)
+        problem = validate_problem(value)
+        embedded = embedded_english_translation(value)
         async with mutation:
             if await store.get("problems", problem["id"]):
                 raise APIError(409, "Problem already exists")
-            await store.put("problems", problem["id"], {**problem, "public_cases": False})
+            stored_problem = {**problem, "public_cases": False}
+            puts = [("problems", problem["id"], stored_problem)]
+            if embedded is not None:
+                puts.append(
+                    (
+                        "problem_translations",
+                        translation_key(problem["id"]),
+                        make_translation_record(
+                            stored_problem, embedded, source="manual", updated_at=now()
+                        ),
+                    )
+                )
+            await store.write_batch(puts=puts)
         return response({"id": problem["id"]}, "add success")
 
     @application.get("/api/problems/{problem_id}")
-    async def problem_info(problem_id: str, user=Depends(current_user)):
+    async def problem_info(problem_id: str, request: Request, user=Depends(current_user)):
+        locale = normalize_locale(request.query_params.get("locale"))
         record = await store.get("problems", problem_id)
         if not record:
             raise APIError(404, "Problem not found")
-        return response(record)
+        translation = (
+            await store.get("problem_translations", translation_key(problem_id))
+            if locale == "en"
+            else None
+        )
+        return response({**record, "content": localized_content(record, locale, translation)})
 
     @application.put("/api/problems/{problem_id}")
     async def edit_problem(problem_id: str, request: Request, user=Depends(current_user)):
-        problem = validate_problem(await body_object(request))
+        value = await body_object(request)
+        problem = validate_problem(value)
+        embedded = embedded_english_translation(value)
         if problem["id"] != problem_id:
             raise APIError(400, "Problem id must match URL")
         async with mutation:
             existing = await store.get("problems", problem_id)
             if not existing:
                 raise APIError(404, "Problem not found")
-            await store.put(
-                "problems",
-                problem_id,
-                {**problem, "public_cases": existing.get("public_cases", False)},
-            )
+            stored_problem = {
+                **problem,
+                "public_cases": existing.get("public_cases", False),
+            }
+            puts = [("problems", problem_id, stored_problem)]
+            if embedded is not None:
+                puts.append(
+                    (
+                        "problem_translations",
+                        translation_key(problem_id),
+                        make_translation_record(
+                            stored_problem, embedded, source="manual", updated_at=now()
+                        ),
+                    )
+                )
+            await store.write_batch(puts=puts)
         return response({"id": problem_id}, "update success")
+
+    @application.put("/api/problems/{problem_id}/translations/en")
+    async def put_problem_translation(
+        problem_id: str, request: Request, user=Depends(current_user)
+    ):
+        value = validate_translation(await body_object(request))
+        async with mutation:
+            problem = await store.get("problems", problem_id)
+            if not problem:
+                raise APIError(404, "Problem not found")
+            record = make_translation_record(problem, value, source="manual", updated_at=now())
+            await store.put("problem_translations", translation_key(problem_id), record)
+        return response(localized_content(problem, "en", record), "translation updated")
+
+    @application.delete("/api/problems/{problem_id}/translations/en")
+    async def delete_problem_translation(problem_id: str, user=Depends(current_user)):
+        if not await store.get("problems", problem_id):
+            raise APIError(404, "Problem not found")
+        await store.delete("problem_translations", translation_key(problem_id))
+        return response({"problem_id": problem_id, "locale": "en"}, "translation deleted")
 
     @application.delete("/api/problems/{problem_id}")
     async def delete_problem(problem_id: str, user=Depends(administrator)):
         async with mutation:
             if not await store.get("problems", problem_id):
                 raise APIError(404, "Problem not found")
-            await store.delete("problems", problem_id)
+            await store.write_batch(
+                deletes=[
+                    ("problems", problem_id),
+                    ("problem_translations", translation_key(problem_id)),
+                ]
+            )
         return response({"id": problem_id}, "delete success")
 
     @application.get("/api/languages/")

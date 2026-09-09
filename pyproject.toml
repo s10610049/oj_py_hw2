@@ -8,8 +8,11 @@ dependencies = [
     "bcrypt",
     "fastapi",
     "httpx",
+    "pillow",
+    "pypdf",
     "psutil",
     "python-dotenv",
+    "pyyaml",
     "streamlit",
     "uvicorn",
 ]
