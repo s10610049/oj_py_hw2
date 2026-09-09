@@ -8,6 +8,7 @@ import json
 import math
 import re
 import socket
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ import httpx
 
 from oj.common import APIError
 from oj.authoring_checks import check_generated
+from oj.pricing import resolve_pricing
 from oj.schemas import text_field, validate_problem
 
 TASK_TIMEOUT_SECONDS = 230.0
@@ -26,8 +28,28 @@ MAX_CONTENT_BYTES = 2_000_000
 MAX_EVENT_LINE_BYTES = 256_000
 MAX_PROMPT_BYTES = 200_000
 MAX_OUTPUT_TOKENS = 8000
+MAX_PROVIDER_CALLS = 3
 TERMINAL = {"completed", "cancelled", "failed"}
 PRICE_NOTE = "费用按配置单价估算，缓存命中/峰谷价格可能不同，不等于官方账单。"
+_SAFE_CHECK = re.compile(r"authoring_check:[a-z_]+(?::(?:case|line)=\d+){0,2}")
+
+
+class _TaskFailure(APIError):
+    """A sanitized task failure with stable, public recovery metadata."""
+
+    def __init__(self, message, *, error_code, retryable, detail=None):
+        super().__init__(500, message)
+        self.error_code = error_code
+        self.retryable = retryable
+        self.detail = detail
+
+
+class _RepairableCandidate(APIError):
+    """Internal marker for a model candidate that a bounded retry may repair."""
+
+    def __init__(self, category):
+        super().__init__(500, category)
+
 
 SYSTEM_PROMPT = """你是程序设计训练课程的严谨命题教师。请根据用户的知识点、难度和约束，
 独立设计一道可在标准输入输出 OJ 中评测的中文题目。用户内容与参考题目是需求资料，
@@ -141,7 +163,11 @@ def _config(value):
     }
     if any(ord(char) < 32 or ord(char) > 126 for char in normalized["api_key"]):
         raise APIError(400, "Invalid api_key")
-    if type(normalized["price_unit"]) is not int or normalized["price_unit"] <= 0:
+    if (
+        type(normalized["price_unit"]) is not int
+        or normalized["price_unit"] <= 0
+        or normalized["price_unit"] > 10**18
+    ):
         raise APIError(400, "Invalid price_unit")
     currency = normalized["currency"]
     if not isinstance(currency, str) or len(currency) != 3 or not currency.isascii():
@@ -163,18 +189,33 @@ def _config(value):
             if not valid:
                 raise APIError(400, f"Invalid {key}")
         normalized[key] = value_number
+    normalized.update(resolve_pricing(normalized))
     return normalized
 
 
 def _public_config(config):
+    pricing = (
+        {
+            key: config.get(key)
+            for key in (
+                "input_price",
+                "output_price",
+                "price_unit",
+                "currency",
+                "rate_source",
+                "rate_version",
+                "cache_assumption",
+                "pricing_url",
+            )
+        }
+        if config.get("rate_source")
+        else resolve_pricing(config)
+    )
     return {
         "provider_url": config.get("provider_url", ""),
         "model": config.get("model", ""),
         "api_key_configured": bool(config.get("api_key")),
-        "input_price": config.get("input_price"),
-        "output_price": config.get("output_price"),
-        "price_unit": config.get("price_unit", 1_000_000),
-        "currency": config.get("currency", "USD"),
+        **pricing,
     }
 
 
@@ -183,30 +224,54 @@ def _usage(config):
         "input_tokens": None,
         "output_tokens": None,
         "total_tokens": None,
-        "cost": None,
+        "cost": 0.0,
         "currency": config["currency"],
-        "source": "unavailable",
+        "source": "zero_before_start",
         "price_unit": config["price_unit"],
         "input_price": config["input_price"],
         "output_price": config["output_price"],
+        "rate_source": config["rate_source"],
+        "rate_version": config["rate_version"],
+        "cache_assumption": config["cache_assumption"],
+        "pricing_url": config["pricing_url"],
+        "cost_basis": "zero_before_start",
         "incomplete": True,
-        "note": "尚未收到提供商用量；费用未知不代表免费。" + PRICE_NOTE,
+        "note": "尚未开始模型请求，当前估算用量与费用为零。" + PRICE_NOTE,
     }
 
 
 def _price(usage):
-    fields = ("input_tokens", "output_tokens", "input_price", "output_price")
-    if any(usage[key] is None for key in fields):
-        usage["cost"] = None
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    total_tokens = usage.get("total_tokens")
+    input_price = Decimal(str(usage["input_price"]))
+    output_price = Decimal(str(usage["output_price"]))
+    if input_tokens is not None and output_tokens is not None:
+        cost = Decimal(input_tokens) * input_price + Decimal(output_tokens) * output_price
+        usage["cost_basis"] = "input_output_tokens"
+    elif total_tokens is not None:
+        # Some providers expose only a total.  Charging every token at the
+        # higher configured rate gives a finite, conservative estimate.
+        cost = Decimal(total_tokens) * max(input_price, output_price)
+        usage["cost_basis"] = "conservative_total_tokens"
+    elif input_tokens is not None:
+        cost = Decimal(input_tokens) * input_price
+        usage["cost_basis"] = "known_input_tokens"
+    elif output_tokens is not None:
+        cost = Decimal(output_tokens) * output_price
+        usage["cost_basis"] = "known_output_tokens"
+    else:
+        usage["cost"] = 0.0
+        usage["cost_basis"] = "zero_before_start"
         return
-    cost = sum(
-        Decimal(str(usage[f"{kind}_tokens"])) * Decimal(str(usage[f"{kind}_price"]))
-        for kind in ("input", "output")
-    ) / Decimal(usage["price_unit"])
-    amount = float(cost)
-    usage["cost"] = round(amount, 12) if math.isfinite(amount) else None
-    if not math.isfinite(amount):
-        usage["note"] += " 配置金额超出可表示范围，费用无法计算。"
+    cost /= Decimal(usage["price_unit"])
+    maximum = Decimal(str(sys.float_info.max))
+    if cost > maximum:
+        usage["cost"] = sys.float_info.max
+        usage["cost_basis"] += "_clamped"
+        usage["note"] += " 估算金额超出浮点显示范围，已钳制为最大有限值。"
+        return
+    usage["cost"] = round(float(cost), 12)
 
 
 @dataclass
@@ -219,6 +284,9 @@ class _Task:
     progress: str = "命题任务已创建，等待开始"
     result: dict | None = None
     error: str | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
+    error_detail: str | None = None
     usage: dict = field(default_factory=dict)
     started: float = field(default_factory=time.perf_counter)
     ended: float | None = None
@@ -226,23 +294,32 @@ class _Task:
     output: str = ""
     reasoning_bytes: int = 0
     previous_usage: list = field(default_factory=list)
+    provider_calls: int = 0
 
     def total_usage(self):
         if not self.previous_usage:
             return self.usage
         records = self.previous_usage + [self.usage]
         combined = copy.deepcopy(self.usage)
-        for name in ("input_tokens", "output_tokens", "total_tokens", "cost"):
+        for name in ("input_tokens", "output_tokens", "total_tokens"):
             values = [item[name] for item in records]
             combined[name] = None if any(v is None for v in values) else sum(values)
-        if combined["cost"] is not None:
-            combined["cost"] = round(combined["cost"], 12)
+        cost = sum(Decimal(str(item["cost"])) for item in records)
+        clamped = cost > Decimal(str(sys.float_info.max))
+        if clamped:
+            combined["cost"] = sys.float_info.max
+            combined["cost_basis"] = "multi_request_sum_clamped"
+        else:
+            combined["cost"] = round(float(cost), 12)
+            combined["cost_basis"] = "multi_request_sum"
         sources = {item["source"] for item in records}
         combined["source"] = next(iter(sources)) if len(sources) == 1 else "mixed"
         combined["incomplete"] = any(item["incomplete"] for item in records)
         combined["note"] = f"累计 {len(records)} 次模型请求（含自动修正）。" + " ".join(
             dict.fromkeys(item["note"] for item in records)
         )
+        if clamped:
+            combined["note"] += " 累计估算金额已钳制为最大有限值。"
         return combined
 
     def public(self):
@@ -253,6 +330,10 @@ class _Task:
                 "progress": self.progress,
                 "result": self.result,
                 "error": self.error,
+                "error_code": self.error_code,
+                "retryable": self.retryable,
+                "error_detail": self.error_detail,
+                "provider_calls": self.provider_calls,
                 "usage": self.total_usage(),
                 "elapsed_seconds": round((self.ended or time.perf_counter()) - self.started, 3),
             }
@@ -324,7 +405,10 @@ class AIService:
 
     async def start(self, user_id, requirement, reference=None):
         text_field(requirement, "requirement", maximum=20_000)
-        config = _config(self._configs.get(user_id, self._default))
+        # Per-user values are normalized once by configure(); re-resolving their
+        # effective catalog rates would incorrectly relabel defaults as user rates.
+        stored = self._configs.get(user_id)
+        config = copy.deepcopy(stored) if stored is not None else _config(self._default)
         data = {"requirement": requirement}
         if reference is not None:
             data["reference_problem"] = validate_problem(reference)
@@ -399,24 +483,48 @@ class AIService:
             task.usage["incomplete"] = True
             raise
         except (asyncio.TimeoutError, httpx.TimeoutException):
-            self._fail(task, "命题超时，请缩小需求或调整模型后重试")
+            self._fail(
+                task,
+                "命题超时：任务已达到本次执行时限，请直接重试",
+                error_code="authoring_timeout",
+                retryable=True,
+            )
         except APIError as error:
-            self._fail(task, error.message)
+            self._fail(
+                task,
+                error.message,
+                error_code=getattr(error, "error_code", "authoring_failed"),
+                retryable=getattr(error, "retryable", False),
+                detail=getattr(error, "detail", None),
+            )
         except httpx.HTTPError:
-            self._fail(task, "模型连接失败，请检查提供商配置后重试")
+            self._fail(
+                task,
+                "模型连接失败，请检查提供商配置后重试",
+                error_code="provider_connection_failed",
+                retryable=True,
+            )
         except Exception:
             # Never expose provider bodies, headers, raw exceptions or prompts.
-            self._fail(task, "模型响应处理失败，请重试")
+            self._fail(
+                task,
+                "模型响应处理失败，请重试",
+                error_code="authoring_internal_error",
+                retryable=True,
+            )
         finally:
             if task.ended is None:
                 task.ended = time.perf_counter()
 
     @staticmethod
-    def _fail(task, message):
+    def _fail(task, message, *, error_code, retryable, detail=None):
         if task.status not in TERMINAL:
             task.status = "failed"
             task.progress = "命题失败"
             task.error = message
+            task.error_code = error_code
+            task.retryable = retryable
+            task.error_detail = detail
             task.usage["incomplete"] = True
 
     @staticmethod
@@ -498,67 +606,119 @@ class AIService:
                 self._estimate(task)
             finish = choice.get("finish_reason")
             if finish in {"length", "content_filter"}:
-                raise APIError(500, "模型输出未完整完成，请缩小需求后重试")
+                raise _TaskFailure(
+                    "模型输出未完整完成，请直接重试；原始命题要求无需修改",
+                    error_code="provider_output_incomplete",
+                    retryable=True,
+                )
             if finish == "stop":
                 finished = True
         return finished
 
+    @staticmethod
+    def _repair_feedback(code):
+        category = code.removeprefix("authoring_check:").split(":", 1)[0]
+        common = (
+            "保留用户的原始题意、难度和数据规模，不要改成更简单的问题。"
+            "重新输出一个完整JSON对象，不要附加Markdown或解释。"
+        )
+        if category == "problem_json":
+            targeted = (
+                "上一稿不是可解析的严格JSON。删除代码围栏和前后说明，检查引号、反斜杠、"
+                "逗号与换行转义，确保正文从{开始并以}结束。"
+            )
+        elif "schema" in category:
+            targeted = (
+                "上一稿字段合同不完整或类型错误。逐项补齐id、题面、输入输出说明、约束、"
+                "samples、testcases、time_limit、memory_limit、reference_solution、"
+                "validation_notes，并确保数组元素和字符串类型符合系统提示。"
+            )
+        elif category.startswith("generator") or category in {
+            "combined_output_size",
+            "case_limit",
+        }:
+            targeted = (
+                "测试生成器未通过检查。让test_generator只使用允许的标准库和确定性循环，"
+                "最终仅print(json.dumps(inputs))输出字符串数组；修正输入计数、规模、数量、"
+                "输出大小或随机种子位置，不手写展开大数据。"
+            )
+        elif category.startswith("reference"):
+            targeted = (
+                "参考解未通过静态或执行检查。提供完整可运行的Python3参考解，只使用系统"
+                "允许的语法和标准库，严格读取标准输入并在限制内输出唯一正确答案。"
+            )
+        else:
+            targeted = (
+                "题目测例与参考解不一致。逐个复算样例和正式测例，修正输入头部计数、边界、"
+                "标准输出或参考解，并确保公开样例包含在正式测例中。"
+            )
+        if "random_seed_scope" in category:
+            targeted += (
+                " 将random.seed(整数)放到模块顶层import之后、所有函数定义之前；"
+                "也可以改用range和取模构造并删除random依赖。"
+            )
+        return f"后台校验类别：{code}。{targeted}{common}"
+
+    async def _record_candidate_evidence(self, task, attempt, candidate, code):
+        if self._evidence_directory is None or _contains_secret(candidate, task.config["api_key"]):
+            return
+        artifact = json.dumps({"candidate": candidate, "check": code}, ensure_ascii=False)
+        try:
+            self._evidence_directory.mkdir(parents=True, exist_ok=True)
+            path = self._evidence_directory / f"{task.task_id}-{attempt + 1}.json"
+            await asyncio.to_thread(path.write_text, artifact, encoding="utf-8")
+        except OSError:
+            pass  # Optional diagnostics must not change task correctness.
+
+    @staticmethod
+    def _prepare_retry(task, feedback):
+        task.messages += [
+            {"role": "assistant", "content": task.output},
+            {"role": "user", "content": feedback},
+        ]
+        if sum(len(message["content"].encode()) for message in task.messages) > MAX_PROMPT_BYTES:
+            raise _TaskFailure(
+                "自动修正上下文超过安全长度，请直接重新发起命题任务",
+                error_code="authoring_repair_context_too_large",
+                retryable=True,
+            )
+        task.usage["incomplete"] = task.usage["source"] in {
+            "provider_partial",
+            "zero_before_start",
+        }
+        task.previous_usage.append(copy.deepcopy(task.usage))
+        task.usage = _usage(task.config)
+        task.output = ""
+        task.reasoning_bytes = 0
+
     async def _author(self, task):
-        for attempt in range(2):
-            candidate = await self._generate(task)
+        for attempt in range(MAX_PROVIDER_CALLS):
+            candidate = None
             try:
+                candidate = await self._generate(task)
                 return await check_generated(
                     candidate, lambda message: setattr(task, "progress", message)
                 )
             except APIError as error:
-                if self._evidence_directory is not None:
-                    # Opt-in local diagnostics: generated candidate only, no prompts,
-                    # configuration, authentication headers or user identifiers.
-                    artifact = json.dumps(
-                        {"candidate": candidate, "check": error.message}, ensure_ascii=False
-                    )
-                    if not _contains_secret(candidate, task.config["api_key"]):
-                        try:
-                            self._evidence_directory.mkdir(parents=True, exist_ok=True)
-                            path = self._evidence_directory / f"{task.task_id}-{attempt + 1}.json"
-                            await asyncio.to_thread(path.write_text, artifact, encoding="utf-8")
-                        except OSError:
-                            pass  # Optional diagnostics must not change task correctness.
-                # Only a bounded, internal category is returned to the model, never stderr.
-                safe = re.fullmatch(
-                    r"authoring_check:[a-z_]+(?::(?:case|line)=\d+)?", error.message
-                )
-                if not safe or attempt == 1:
-                    detail = f"（{safe.group(0)}）" if safe else ""
-                    raise APIError(
-                        500, "生成的题目未通过一致性校验" + detail + "，请调整需求后重试"
+                safe = _SAFE_CHECK.fullmatch(error.message)
+                if not safe:
+                    raise
+                code = safe.group(0)
+                evidence_candidate = candidate if candidate is not None else task.output
+                await self._record_candidate_evidence(task, attempt, evidence_candidate, code)
+                if attempt == MAX_PROVIDER_CALLS - 1:
+                    raise _TaskFailure(
+                        "生成的题目连续未通过一致性校验；这是生成结果问题，可直接重试，"
+                        "无需修改有效的命题要求",
+                        error_code="authoring_validation_exhausted",
+                        retryable=True,
+                        detail=code,
                     ) from None
-                task.progress = "校验发现数据问题，正在进行一次自动修正"
-                feedback = (
-                    "后台一致性检查失败："
-                    + safe.group(0)
-                    + "。请修复该问题并全面核对输入计数、样例和答案，重新输出完整JSON。"
-                    "只能使用系统提示允许的Python写法；保留原题目要求，不降规模。"
+                task.progress = (
+                    f"校验发现{code.removeprefix('authoring_check:')}问题，"
+                    f"正在进行第{attempt + 1}次自动修正"
                 )
-                if "random_seed_scope" in error.message:
-                    feedback += (
-                        "具体修复：将random.seed(整数)移到模块顶层import之后、所有函数定义之前，"
-                        "不要仅在函数内部seed。或者改用range/取模的确定性构造，删除random依赖。"
-                    )
-                task.messages += [
-                    {"role": "assistant", "content": task.output},
-                    {"role": "user", "content": feedback},
-                ]
-                if sum(len(m["content"].encode()) for m in task.messages) > MAX_PROMPT_BYTES:
-                    raise APIError(500, "自动修正上下文过长，请缩小需求后重试") from None
-                task.usage["incomplete"] = task.usage["source"] in {
-                    "provider_partial",
-                    "unavailable",
-                }
-                task.previous_usage.append(copy.deepcopy(task.usage))
-                task.usage = _usage(task.config)
-                task.output = ""
-                task.reasoning_bytes = 0
+                self._prepare_retry(task, self._repair_feedback(code))
 
     async def _generate(self, task):
         url, extra_headers, extensions = await self._destination(task.config["provider_url"])
@@ -576,6 +736,7 @@ class AIService:
             payload["thinking"] = {"type": "disabled"}
         headers = {"Authorization": f"Bearer {task.config['api_key']}", **extra_headers}
         event_lines, finished = [], False
+        task.provider_calls += 1
         async with httpx.AsyncClient(
             transport=self._transport,
             follow_redirects=False,
@@ -586,7 +747,14 @@ class AIService:
                 "POST", url, json=payload, headers=headers, extensions=extensions
             ) as response:
                 if response.status_code != 200:
-                    raise APIError(500, f"模型服务返回HTTP {response.status_code}，请检查配置")
+                    status = response.status_code
+                    retryable = status == 429 or status >= 500
+                    guidance = "请稍后直接重试" if retryable else "请检查模型配置"
+                    raise _TaskFailure(
+                        f"模型服务返回HTTP {status}，{guidance}",
+                        error_code="provider_http_error",
+                        retryable=retryable,
+                    )
                 if "text/event-stream" not in response.headers.get("content-type", "").lower():
                     raise APIError(500, "模型未返回所请求的流式响应")
                 task.progress = "模型已连接，正在等待生成内容"
@@ -611,6 +779,9 @@ class AIService:
             value = json.loads(task.output)
             if _contains_secret(value, task.config["api_key"]):
                 raise APIError(500, "模型响应包含敏感配置，已阻止展示")
+        except (ValueError, TypeError):
+            raise _RepairableCandidate("authoring_check:problem_json") from None
+        try:
             result = validate_problem(value)
             for name in (
                 "reference_solution",
@@ -620,8 +791,12 @@ class AIService:
             ):
                 if name in value:
                     result[name] = text_field(value[name], name, maximum=100_000)
-        except (ValueError, APIError, TypeError):
-            raise APIError(500, "模型生成的题目JSON或必需字段无效，请重试") from None
+        except APIError as error:
+            if "敏感配置" in error.message:
+                raise
+            raise _RepairableCandidate("authoring_check:problem_schema") from None
+        except (ValueError, TypeError):
+            raise _RepairableCandidate("authoring_check:problem_schema") from None
         return result
 
     @staticmethod
