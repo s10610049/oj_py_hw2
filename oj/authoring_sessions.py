@@ -46,7 +46,9 @@ MAX_ATTACHMENTS = 8
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
-StartTask = Callable[[str, str, tuple[Mapping[str, str], ...]], Awaitable[Mapping[str, Any]]]
+StartTask = Callable[
+    [str, str, tuple[Mapping[str, str], ...], str | None], Awaitable[Mapping[str, Any]]
+]
 GetTask = Callable[[str, str], Awaitable[Mapping[str, Any]]]
 CancelTask = Callable[[str, str], Awaitable[Mapping[str, Any]]]
 
@@ -138,6 +140,7 @@ def normalize_request(value: Any) -> dict[str, Any]:
         "difficulty_id",
         "free_prompt",
         "attachments",
+        "reference_problem_id",
     }
     if set(value) - allowed:
         raise APIError(400, "Authoring request contains unsupported fields")
@@ -178,6 +181,13 @@ def normalize_request(value: Any) -> dict[str, Any]:
     difficulty = difficulty_by_id(difficulty_id)
     if difficulty is None:
         raise APIError(400, "Unknown difficulty")
+    reference_problem_id = value.get("reference_problem_id")
+    if reference_problem_id is not None and (
+        not isinstance(reference_problem_id, str)
+        or not _IDENTIFIER.fullmatch(reference_problem_id)
+        or len(reference_problem_id) > 80
+    ):
+        raise APIError(400, "Invalid reference_problem_id")
     return {
         "schema_version": REQUEST_SCHEMA,
         "requirement": requirement,
@@ -191,6 +201,7 @@ def normalize_request(value: Any) -> dict[str, Any]:
         },
         "free_prompt": free_prompt,
         "attachments": _attachment_references(value.get("attachments")),
+        "reference_problem_id": reference_problem_id,
     }
 
 
@@ -483,6 +494,7 @@ class AuthoringSessionService:
                     owner_id,
                     prompt,
                     tuple(copy.deepcopy(normalized["attachments"])),
+                    normalized["reference_problem_id"],
                 )
             )
             timestamp = self.clock()
@@ -623,6 +635,7 @@ class AuthoringSessionService:
                 session["owner_id"],
                 prompt,
                 tuple(copy.deepcopy(request["attachments"])),
+                request["reference_problem_id"],
             )
         )
         number = expected_revision + 1
@@ -719,6 +732,18 @@ class AuthoringSessionService:
                 key_hash=key_hash,
                 fingerprint=fingerprint,
             )
+
+    async def cancel_active(self, session_id: str, owner_id: str) -> dict[str, Any]:
+        """Cancel the current task without creating a synthetic revision."""
+
+        session_id, owner_id = self._validate_session_id(session_id), _owner(owner_id)
+        async with self._lock(session_id):
+            session = await self._load(session_id, owner_id)
+            await self._sync_current(session)
+            if session["revisions"][-1]["task"]["status"] not in ACTIVE_TASK_STATUSES:
+                raise APIError(409, "Authoring task has already ended")
+            await self._cancel_current(session)
+            return self._public(session)
 
     async def recover_after_restart(self) -> int:
         """Seal orphaned active revisions without deleting any task history."""

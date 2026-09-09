@@ -36,6 +36,11 @@ INTRODUCTION = (
     "你好，我是你的编程学习助手。我可以结合你的题目完成情况，解释算法、定位思路问题，"
     "并给出循序渐进的提示。把题意、报错或卡住的步骤发给我即可。"
 )
+INTRODUCTION_EN = (
+    "Hi, I’m your programming learning assistant. I can use your problem-solving progress "
+    "to explain algorithms, diagnose where an approach gets stuck, and offer graduated "
+    "hints. Send me the problem, error, or step you are working on."
+)
 
 SYSTEM_PROMPT = """你是在线评测系统中的编程学习助手。回答必须专业、精简、准确，优先解释思路、
 提出诊断问题和分层提示，帮助学习者自己完成；只有用户明确要求时才给完整代码，并解释关键不变量。
@@ -456,10 +461,16 @@ class ProgrammingChatService:
             raise ChatError(503, "编程助手服务已停止", "chat_service_closed", retryable=True)
         await self.initialize()
 
-    async def create_session(self, owner, title=None):
+    async def create_session(self, owner, title=None, *, locale="zh-CN"):
         await self._ready()
         owner = _identifier(owner, "owner", maximum=200)
-        title = "新会话" if title is None else _text(title, "title", maximum_bytes=400)
+        if locale not in {"zh-CN", "en"}:
+            raise ChatError(400, "会话语言无效", "invalid_locale")
+        title = (
+            ("新会话" if locale == "zh-CN" else "New chat")
+            if title is None
+            else _text(title, "title", maximum_bytes=400)
+        )
         created = self._clock()
         session_id = self._id()
         session = {
@@ -467,6 +478,7 @@ class ProgrammingChatService:
             "session_id": session_id,
             "owner": owner,
             "title": title,
+            "locale": locale,
             "created_at": created,
             "updated_at": created,
             "last_context_epoch": None,
@@ -475,7 +487,7 @@ class ProgrammingChatService:
                 {
                     "message_id": self._id(),
                     "role": "assistant",
-                    "content": INTRODUCTION,
+                    "content": INTRODUCTION if locale == "zh-CN" else INTRODUCTION_EN,
                     "created_at": created,
                     "turn_id": None,
                 }

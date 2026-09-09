@@ -19,6 +19,9 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect
 
+from oj.authoring_adapter import AuthoringTaskAdapter
+from oj.authoring_sessions import AuthoringSessionService
+from oj.chat import ChatError, ProgrammingChatService, build_programming_context
 from oj.common import APIError, response
 from oj.progress import build_progress_payloads, problem_version_digest
 from oj.schemas import identifier, paginate, pagination, text_field, validate_problem
@@ -31,7 +34,8 @@ from oj.translations import (
     translation_key,
     validate_translation,
 )
-from shared.taxonomy import normalize_difficulty
+from shared.knowledge import KNOWLEDGE_CATEGORIES, KNOWLEDGE_POINTS, KNOWLEDGE_VERSION
+from shared.taxonomy import DIFFICULTIES, TAXONOMY_VERSION, normalize_difficulty
 
 COOKIE = "oj_session"
 SESSION_SECONDS = 24 * 3600
@@ -148,24 +152,41 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             await asyncio.gather(*running, return_exceptions=True)
         jobs.clear()
 
-    @asynccontextmanager
-    async def lifespan(application):
+    async def install_assistant_services(application):
         from oj.ai import AIService
 
+        ai = AIService(
+            default_config=load_ai_config() if ai_config is None else ai_config or None,
+            evidence_directory=(
+                "runtime/authoring-evidence" if os.environ.get("OJ_AI_EVIDENCE") == "1" else None
+            ),
+        )
+        adapter = AuthoringTaskAdapter(store, ai)
+        authoring = AuthoringSessionService(
+            store,
+            start_task=adapter.start,
+            get_task=adapter.get,
+            cancel_task=adapter.cancel,
+        )
+        chat = ProgrammingChatService(store)
+        application.state.ai = ai
+        application.state.authoring = authoring
+        application.state.chat = chat
+        await authoring.recover_after_restart()
+        await chat.initialize()
+
+    @asynccontextmanager
+    async def lifespan(application):
         await store.initialize()
         await initialize_defaults()
         for submission in await store.all("submissions"):
             if submission["status"] == "pending":
                 submission.update(status="error", error_info="评测被服务重启中断，请重新评测")
                 await store.put("submissions", submission["submission_id"], submission)
-        application.state.ai = AIService(
-            default_config=load_ai_config() if ai_config is None else ai_config or None,
-            evidence_directory=(
-                "runtime/authoring-evidence" if os.environ.get("OJ_AI_EVIDENCE") == "1" else None
-            ),
-        )
+        await install_assistant_services(application)
         yield
         await cancel_jobs()
+        await application.state.chat.close()
         await application.state.ai.close()
 
     application = FastAPI(title="OJ · 编程练习室", version="1.0.0", lifespan=lifespan)
@@ -196,7 +217,11 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             # generation instead of blocking unrelated cancellation or reset.
             request.state.ai_service = application.state.ai
             return await call_next(request)
-        if writes or request.url.path.endswith("/log"):
+        if (
+            writes
+            or request.url.path.endswith("/log")
+            or request.url.path.startswith("/api/ai/authoring-sessions/")
+        ):
             # Authentication happens inside this lock, so a reset invalidates
             # sessions for any delayed upload before it can reach a mutation.
             async with lifecycle:
@@ -208,6 +233,12 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             raise request.state.body_error
         buffered = getattr(request.state, "buffered_body", None)
         return buffered if buffered is not None else await read_body(request)
+
+    @application.exception_handler(ChatError)
+    async def expected_chat_error(request, exc):
+        return response(
+            {"error_code": exc.error_code, "retryable": exc.retryable}, exc.message, exc.status
+        )
 
     @application.exception_handler(APIError)
     async def expected_error(request, exc):
@@ -278,7 +309,7 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
         if (
             not record
             or record.get("owner") != owner
-            or not isinstance(record.get("expires_epoch"), (int, float))
+            or type(record.get("expires_epoch")) not in (int, float)
             or record["expires_epoch"] <= time.time()
         ):
             raise APIError(404, "Temporary resource not found or expired")
@@ -288,7 +319,7 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
         current = time.time()
         for record in await store.all(namespace):
             if (
-                isinstance(record.get("expires_epoch"), (int, float))
+                type(record.get("expires_epoch")) in (int, float)
                 and record["expires_epoch"] <= current
             ):
                 await store.delete(namespace, record["id"])
@@ -1088,19 +1119,136 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
             await application.state.ai.cancel(task_id, user["user_id"], user["role"] == "admin")
         )
 
+    @application.get("/api/ai/authoring-options/")
+    async def authoring_options(user=Depends(current_user)):
+        return response(
+            {
+                "difficulty_taxonomy_version": TAXONOMY_VERSION,
+                "difficulties": [dict(item) for item in DIFFICULTIES],
+                "knowledge_taxonomy_version": KNOWLEDGE_VERSION,
+                "knowledge_categories": [dict(item) for item in KNOWLEDGE_CATEGORIES],
+                "knowledge_points": [dict(item) for item in KNOWLEDGE_POINTS],
+            }
+        )
+
+    @application.post("/api/ai/authoring-sessions/")
+    async def start_authoring_session(request: Request, user=Depends(current_user)):
+        value = await body_object(request)
+        return response(
+            await application.state.authoring.initial(
+                user["user_id"],
+                value.get("request"),
+                idempotency_key=value.get("idempotency_key"),
+            )
+        )
+
+    @application.get("/api/ai/authoring-sessions/{session_id}")
+    async def authoring_session_status(session_id: str, user=Depends(current_user)):
+        return response(await application.state.authoring.poll(session_id, user["user_id"]))
+
+    @application.post("/api/ai/authoring-sessions/{session_id}/requirements")
+    async def replace_authoring_requirements(
+        session_id: str, request: Request, user=Depends(current_user)
+    ):
+        value = await body_object(request)
+        return response(
+            await application.state.authoring.replace_requirements(
+                session_id,
+                user["user_id"],
+                value.get("request"),
+                expected_revision=value.get("expected_revision"),
+                idempotency_key=value.get("idempotency_key"),
+            )
+        )
+
+    @application.post("/api/ai/authoring-sessions/{session_id}/refinements")
+    async def refine_authoring_draft(session_id: str, request: Request, user=Depends(current_user)):
+        value = await body_object(request)
+        improvement = value.get("improvement", value.get("instruction"))
+        return response(
+            await application.state.authoring.refine_draft(
+                session_id,
+                user["user_id"],
+                improvement,
+                expected_revision=value.get("expected_revision"),
+                idempotency_key=value.get("idempotency_key"),
+            )
+        )
+
+    @application.delete("/api/ai/authoring-sessions/{session_id}/active-task")
+    async def cancel_authoring_task(session_id: str, user=Depends(current_user)):
+        return response(
+            await application.state.authoring.cancel_active(session_id, user["user_id"])
+        )
+
+    @application.get("/api/chat/sessions/")
+    async def chat_sessions(user=Depends(current_user)):
+        return response(await application.state.chat.list_sessions(user["user_id"]))
+
+    @application.post("/api/chat/sessions/")
+    async def create_chat_session(request: Request, user=Depends(current_user)):
+        value = await body_object(request)
+        locale = normalize_locale(value.get("locale"))
+        return response(
+            await application.state.chat.create_session(
+                user["user_id"], value.get("title"), locale=locale
+            )
+        )
+
+    @application.get("/api/chat/sessions/{session_id}")
+    async def chat_session(session_id: str, user=Depends(current_user)):
+        return response(await application.state.chat.get_session(session_id, user["user_id"]))
+
+    @application.delete("/api/chat/sessions/{session_id}")
+    async def delete_chat_session(session_id: str, user=Depends(current_user)):
+        return response(await application.state.chat.delete_session(session_id, user["user_id"]))
+
+    @application.get("/api/chat/sessions/{session_id}/turns/")
+    async def chat_turns(session_id: str, user=Depends(current_user)):
+        return response(await application.state.chat.list_turns(session_id, user["user_id"]))
+
+    @application.post("/api/chat/sessions/{session_id}/turns/")
+    async def create_chat_turn(session_id: str, request: Request, user=Depends(current_user)):
+        value = await body_object(request)
+        statuses, statistics = await personal_progress(user)
+        context = build_programming_context(statuses, statistics)
+        return response(
+            await application.state.chat.create_turn(
+                session_id,
+                user["user_id"],
+                value.get("message"),
+                expected_context_epoch=value.get("expected_context_epoch"),
+                context=context,
+                config=application.state.ai.private_config(user["user_id"]),
+                idempotency_key=value.get("idempotency_key"),
+            )
+        )
+
+    async def owned_chat_turn(session_id, turn_id, user):
+        turn = await application.state.chat.get_turn(turn_id, user["user_id"])
+        if turn.get("session_id") != session_id:
+            raise ChatError(404, "回答任务不存在", "chat_turn_not_found")
+        return turn
+
+    @application.get("/api/chat/sessions/{session_id}/turns/{turn_id}")
+    async def chat_turn(session_id: str, turn_id: str, user=Depends(current_user)):
+        return response(await owned_chat_turn(session_id, turn_id, user))
+
+    @application.delete("/api/chat/sessions/{session_id}/turns/{turn_id}")
+    async def cancel_chat_turn(session_id: str, turn_id: str, user=Depends(current_user)):
+        await owned_chat_turn(session_id, turn_id, user)
+        return response(await application.state.chat.cancel_turn(turn_id, user["user_id"]))
+
     @application.post("/api/reset/")
     async def reset(user=Depends(administrator)):
-        from oj.ai import AIService
-
         await cancel_jobs()
+        await application.state.chat.close()
         await application.state.ai.close()
         async with mutation:
             await store.clear()
             recent_submissions.clear()
             await initialize_defaults()
-            application.state.ai = AIService(
-                default_config=load_ai_config() if ai_config is None else ai_config or None
-            )
+            await install_assistant_services(application)
         result = response(None, "system reset successfully")
         result.delete_cookie(COOKIE)
         return result

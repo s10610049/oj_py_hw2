@@ -69,7 +69,7 @@ class FakeAI:
     def _public(self, task_id):
         return copy.deepcopy(self.tasks[task_id])
 
-    async def start(self, owner_id, prompt, attachment_refs):
+    async def start(self, owner_id, prompt, attachment_refs, reference_problem_id=None):
         self.events.append(("start", owner_id))
         if self.start_delay:
             await asyncio.sleep(self.start_delay)
@@ -92,6 +92,7 @@ class FakeAI:
         }
         self.prompts[task_id] = prompt
         self.references[task_id] = copy.deepcopy(attachment_refs)
+        self.tasks[task_id]["reference_problem_id"] = reference_problem_id
         return self._public(task_id)
 
     async def get(self, task_id, owner_id):
@@ -216,6 +217,7 @@ async def test_initial_revision_is_structured_persistent_and_attachment_referenc
         authoring_request(knowledge_point_ids=["unknown.point"]),
         authoring_request(difficulty_id="提高"),
         authoring_request(free_prompt="x" * 10_001),
+        authoring_request(reference_problem_id="invalid/id"),
         authoring_request(extra="unsupported"),
         authoring_request(
             attachments=[
@@ -249,6 +251,9 @@ def test_normalization_rejects_duplicate_attachments_and_preserves_order():
             )
         )
     assert caught.value.status == 400
+
+    normalized = normalize_request(authoring_request(reference_problem_id="REF-001"))
+    assert normalized["reference_problem_id"] == "REF-001"
     value = normalize_request(authoring_request())
     assert [point["id"] for point in value["knowledge_points"]] == [
         "engineering.deadlock",
@@ -653,3 +658,31 @@ async def test_ai_task_identity_and_json_contract_are_enforced(tmp_path):
     with pytest.raises(APIError) as missing_result:
         await service.poll(initial["session_id"], "alice")
     assert missing_result.value.status == 502
+
+
+@pytest.mark.asyncio
+async def test_owner_can_cancel_active_revision_without_creating_history(tmp_path):
+    _, ai, service = await environment(tmp_path)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+
+    cancelled = await service.cancel_active(initial["session_id"], "alice")
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["current_revision"] == 1
+    assert len(cancelled["revisions"]) == 1
+    assert [event[0] for event in ai.events] == ["start", "get", "cancel"]
+    with pytest.raises(APIError) as terminal:
+        await service.cancel_active(initial["session_id"], "alice")
+    assert terminal.value.status == 409
+
+
+@pytest.mark.asyncio
+async def test_other_owner_cannot_cancel_active_revision(tmp_path):
+    _, ai, service = await environment(tmp_path)
+    initial = await service.initial("alice", authoring_request(), idempotency_key="initial")
+
+    with pytest.raises(APIError) as denied:
+        await service.cancel_active(initial["session_id"], "bob")
+
+    assert denied.value.status == 403
+    assert [event[0] for event in ai.events] == ["start"]
