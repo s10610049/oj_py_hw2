@@ -294,7 +294,8 @@ async def test_global_language_registration_and_use(api):
             },
         )
     )["submission_id"]
-    assert (await settled(c, key))["score"] == 20
+    evaluated = await settled(c, key)
+    assert evaluated["score"] == 20, evaluated
 
 
 @pytest.mark.asyncio

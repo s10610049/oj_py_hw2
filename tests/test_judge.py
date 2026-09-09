@@ -447,3 +447,16 @@ async def test_linux_address_space_limit_is_set():
         await judge_submission(problem(expected=str(64 * 1024 * 1024), memory=64), PYTHON, code),
         "AC",
     )
+
+
+@pytest.mark.asyncio
+async def test_await_future_injected_memory_error_is_runtime_error():
+    code = (
+        "import asyncio\n"
+        "async def main():\n"
+        " f=asyncio.get_running_loop().create_future()\n"
+        " f.set_exception(MemoryError())\n"
+        " await f\n"
+        "asyncio.run(main())\n"
+    )
+    assert_verdict(await judge_submission(problem(), PYTHON, code), "RE")

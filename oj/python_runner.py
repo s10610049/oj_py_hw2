@@ -35,6 +35,7 @@ def allocation_failure(error: BaseException, replay_sites=()) -> bool:
         "YIELD_FROM",
         "RETURN_GENERATOR",
         "GEN_START",
+        "SEND",  # Awaiting an already-failed Future injects an exception here.
     }
 
 
