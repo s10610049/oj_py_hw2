@@ -462,6 +462,15 @@ async def test_reference_validation_and_prompt(services, config, problem):
     assert prompt_input["reference_problem"]["id"] == problem["id"]
     assert "不声称已经运行代码" in SYSTEM_PROMPT and "不同复杂度" in SYSTEM_PROMPT
     assert "不要 Markdown" in SYSTEM_PROMPT and "真实多线程" in SYSTEM_PROMPT
+    actual_system = requests[0]["messages"][0]["content"]
+    assert actual_system == SYSTEM_PROMPT
+    for required in (
+        "自然的低效解法",
+        "多层汇合分叉的无环图",
+        "不以sleep、人为重复运算制造慢解",
+        "预期区分而非已验证TLE",
+    ):
+        assert required in actual_system
 
 
 @pytest.mark.asyncio
