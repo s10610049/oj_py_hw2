@@ -1,4 +1,4 @@
-"""Asynchronous AI authoring; model output is data and is never executed here."""
+"""Asynchronous authoring with a bounded, restricted consistency-check pipeline."""
 
 import asyncio
 import codecs
@@ -6,21 +6,26 @@ import copy
 import ipaddress
 import json
 import math
+import re
 import socket
 import time
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 
 from oj.common import APIError
+from oj.authoring_checks import check_generated
 from oj.schemas import text_field, validate_problem
 
 TASK_TIMEOUT_SECONDS = 230.0
-MAX_STREAM_BYTES = 2_000_000
+MAX_STREAM_BYTES = 16_000_000  # SSE metadata repeats per token; distinct from generated content.
+MAX_CONTENT_BYTES = 2_000_000
+MAX_EVENT_LINE_BYTES = 256_000
 MAX_PROMPT_BYTES = 200_000
-MAX_OUTPUT_TOKENS = 8192
+MAX_OUTPUT_TOKENS = 8000
 TERMINAL = {"completed", "cancelled", "failed"}
 PRICE_NOTE = "费用按配置单价估算，缓存命中/峰谷价格可能不同，不等于官方账单。"
 
@@ -34,14 +39,33 @@ samples/testcases 都是非空数组，每项必须有字符串 input/output，�
 还须给出 hint、source（写AI生成，不伪造引用）、tags（字符串数组）、time_limit（正数，秒）、
 memory_limit（正整数，MB）、author、difficulty。题目、约束、样例和测例答案必须互相一致。
 
-题面要明确输入数量、范围、特殊情况和输出含义，样例至少2个；测试点建议8—16个，
+题面要明确输入数量、范围、特殊情况和输出含义，样例至少2个；最终测试点建议10—16个，
 覆盖最小/最大合法边界、典型路径、重复或相等、零/负数（仅在合法时）、易错和退化情况。
 认真计算每组标准输出，不用占位符、伪随机无法复现的数据或省略号代替输入输出。
-数据规模和构造应能区分题目声明的不同复杂度解法。不要声称少量小测例已经验证性能；
-若大规模数据难以直接列出，可附 test_generation_notes 描述确定性的补充构造与局限。
+数据规模和构造应能区分题目声明的不同复杂度解法。不要声称少量小测例已经验证性能。
+严格控制输出：testcases 字面数组只写4—8个小测例，输入内容合计不超过4000字符。
+大规模/最大边界必须用下述 test_generator 构造；生成器产出的点同样会成为正式testcases！
+绝不能将几百或几千条边、重复数字手写到JSON；禁止在testcases和生成器重复展开大数据。
+所有公开样例也必须收录在testcases中；若题目有T组输入，必须有T>1的正式测试点。
+检查典型错解能否被测试击败，不要用很多同质小数据替代覆盖。图题若允许不连通图，
+应包含“起点所在分量无环、另一分量才有环”的测试；自环本身就是环，不能在提示中说不影响。
+至少一个生成器测例应达到声明规模上界。附test_generation_notes如实解释覆盖与局限，
+不能擅自缩小用户指定范围。用循环构造数据，头部数量一定来自len，不能猜数量。
+输出前交叉核对题面、提示、参考解与每组输入输出；特别检查边界描述是否互相矛盾。
 禁止要求额外第三方库、网络访问、文件路径或真实多线程；并发/死锁知识可抽象成有向图等。
-参考程序只能作为文本：可附 reference_solution（Python3标准库代码字符串）及 validation_notes
+必须附 reference_solution（完整可运行的Python3代码字符串）及 validation_notes
 （答案推导、边界覆盖说明字符串）。不声称已经运行代码或完成测试。保持题目可理解、可讲解，
+后台会实际检查参考解与每个答案的一致性；必须严格读取输入，不忽略缺失数据。
+必须附 test_generator（Python代码字符串），通过确定性循环构造4—8组补充输入（最多12组），
+并 print(json.dumps(inputs)) 输出字符串数组；不输出答案，后台用参考解计算。
+计数头部必须使用 len 实际计算，不能与构造条数不符。生成器运行两次应完全一致。
+参考解和生成器仅可用算法语句、普通函数、input/print 和标准库 sys.stdin/stdout、collections、
+math、heapq、bisect、itertools、functools、random（显式seed）、json.dumps/loads。
+严禁文件/网络/进程访问、动态调用、类、装饰器、dunder名称、字符串format与未列出模块；
+直接调用 main()，不要写 if __name__ == '__main__'。不要调用 sys.setrecursionlimit，优先迭代算法。
+使用 data = sys.stdin.read().split()；不要给input赋值，不要把读取方法另存别名，不用装饰器缓存。
+生成器优先用range和取模构造，不必使用随机数。若确需random，必须在模块顶层import后立即写
+random.seed(42)，在所有函数定义之前；不能把random.seed放在函数内部。
 控制篇幅，优先完成完整有效的题面和测试数据。"""
 
 
@@ -175,6 +199,25 @@ class _Task:
     future: asyncio.Task | None = None
     output: str = ""
     reasoning_bytes: int = 0
+    previous_usage: list = field(default_factory=list)
+
+    def total_usage(self):
+        if not self.previous_usage:
+            return self.usage
+        records = self.previous_usage + [self.usage]
+        combined = copy.deepcopy(self.usage)
+        for name in ("input_tokens", "output_tokens", "total_tokens", "cost"):
+            values = [item[name] for item in records]
+            combined[name] = None if any(v is None for v in values) else sum(values)
+        if combined["cost"] is not None:
+            combined["cost"] = round(combined["cost"], 12)
+        sources = {item["source"] for item in records}
+        combined["source"] = next(iter(sources)) if len(sources) == 1 else "mixed"
+        combined["incomplete"] = any(item["incomplete"] for item in records)
+        combined["note"] = f"累计 {len(records)} 次模型请求（含自动修正）。" + " ".join(
+            dict.fromkeys(item["note"] for item in records)
+        )
+        return combined
 
     def public(self):
         return copy.deepcopy(
@@ -184,7 +227,7 @@ class _Task:
                 "progress": self.progress,
                 "result": self.result,
                 "error": self.error,
-                "usage": self.usage,
+                "usage": self.total_usage(),
                 "elapsed_seconds": round((self.ended or time.perf_counter()) - self.started, 3),
             }
         )
@@ -193,12 +236,13 @@ class _Task:
 class AIService:
     """Per-user configuration and owned tasks; callers provide authenticated IDs."""
 
-    def __init__(self, default_config=None, *, transport=None):
+    def __init__(self, default_config=None, *, transport=None, evidence_directory=None):
         self._default = copy.deepcopy(default_config or {})
         self._configs = {}
         self._tasks = {}
         self._transport = transport
         self._generation = 0
+        self._evidence_directory = Path(evidence_directory) if evidence_directory else None
 
     async def _destination(self, provider_url):
         url = httpx.URL(provider_url)
@@ -310,11 +354,11 @@ class AIService:
         task.status = "running"
         task.progress = "正在连接模型并提交命题需求"
         try:
-            result = await asyncio.wait_for(self._generate(task), TASK_TIMEOUT_SECONDS)
+            result = await asyncio.wait_for(self._author(task), TASK_TIMEOUT_SECONDS)
             if task.status == "running":
                 task.result = result
                 task.status = "completed"
-                task.progress = "题目结构校验完成，请审阅题面、答案和测试覆盖后入库"
+                task.progress = "参考解与测例一致性校验完成，请审阅题意和覆盖后入库"
                 task.usage["incomplete"] = task.usage["source"] in {
                     "provider_partial",
                     "unavailable",
@@ -416,6 +460,8 @@ class AIService:
                 raise APIError(500, "模型生成内容格式无效")
             task.output += content
             task.reasoning_bytes += len(reasoning.encode())
+            if len(task.output.encode()) + task.reasoning_bytes > MAX_CONTENT_BYTES:
+                raise APIError(500, "模型生成内容超过安全长度限制")
             if content or reasoning:
                 task.progress = f"正在接收模型生成内容（已接收{len(task.output)}个正文字符）"
                 self._estimate(task)
@@ -425,6 +471,63 @@ class AIService:
             if finish == "stop":
                 finished = True
         return finished
+
+    async def _author(self, task):
+        for attempt in range(2):
+            candidate = await self._generate(task)
+            try:
+                return await check_generated(
+                    candidate, lambda message: setattr(task, "progress", message)
+                )
+            except APIError as error:
+                if self._evidence_directory is not None:
+                    # Opt-in local diagnostics: generated candidate only, no prompts,
+                    # configuration, authentication headers or user identifiers.
+                    artifact = json.dumps(
+                        {"candidate": candidate, "check": error.message}, ensure_ascii=False
+                    )
+                    if task.config["api_key"] not in artifact:
+                        try:
+                            self._evidence_directory.mkdir(parents=True, exist_ok=True)
+                            path = self._evidence_directory / f"{task.task_id}-{attempt + 1}.json"
+                            await asyncio.to_thread(path.write_text, artifact, encoding="utf-8")
+                        except OSError:
+                            pass  # Optional diagnostics must not change task correctness.
+                # Only a bounded, internal category is returned to the model, never stderr.
+                safe = re.fullmatch(
+                    r"authoring_check:[a-z_]+(?::(?:case|line)=\d+)?", error.message
+                )
+                if not safe or attempt == 1:
+                    detail = f"（{safe.group(0)}）" if safe else ""
+                    raise APIError(
+                        500, "生成的题目未通过一致性校验" + detail + "，请调整需求后重试"
+                    ) from None
+                task.progress = "校验发现数据问题，正在进行一次自动修正"
+                feedback = (
+                    "后台一致性检查失败："
+                    + safe.group(0)
+                    + "。请修复该问题并全面核对输入计数、样例和答案，重新输出完整JSON。"
+                    "只能使用系统提示允许的Python写法；保留原题目要求，不降规模。"
+                )
+                if "random_seed_scope" in error.message:
+                    feedback += (
+                        "具体修复：将random.seed(整数)移到模块顶层import之后、所有函数定义之前，"
+                        "不要仅在函数内部seed。或者改用range/取模的确定性构造，删除random依赖。"
+                    )
+                task.messages += [
+                    {"role": "assistant", "content": task.output},
+                    {"role": "user", "content": feedback},
+                ]
+                if sum(len(m["content"].encode()) for m in task.messages) > MAX_PROMPT_BYTES:
+                    raise APIError(500, "自动修正上下文过长，请缩小需求后重试") from None
+                task.usage["incomplete"] = task.usage["source"] in {
+                    "provider_partial",
+                    "unavailable",
+                }
+                task.previous_usage.append(copy.deepcopy(task.usage))
+                task.usage = _usage(task.config)
+                task.output = ""
+                task.reasoning_bytes = 0
 
     async def _generate(self, task):
         url, extra_headers, extensions = await self._destination(task.config["provider_url"])
@@ -478,7 +581,12 @@ class AIService:
             if task.config["api_key"] in json.dumps(value, ensure_ascii=False):
                 raise APIError(500, "模型响应包含敏感配置，已阻止展示")
             result = validate_problem(value)
-            for name in ("reference_solution", "validation_notes", "test_generation_notes"):
+            for name in (
+                "reference_solution",
+                "test_generator",
+                "validation_notes",
+                "test_generation_notes",
+            ):
                 if name in value:
                     result[name] = text_field(value[name], name, maximum=100_000)
         except (ValueError, APIError, TypeError):
@@ -496,7 +604,11 @@ class AIService:
             buffered += decoder.decode(chunk)
             while "\n" in buffered:
                 line, buffered = buffered.split("\n", 1)
+                if len(line.encode()) > MAX_EVENT_LINE_BYTES:
+                    raise APIError(500, "模型流事件超过安全长度限制")
                 yield line.rstrip("\r")
+            if len(buffered.encode()) > MAX_EVENT_LINE_BYTES:
+                raise APIError(500, "模型流事件超过安全长度限制")
         buffered += decoder.decode(b"", final=True)
         if buffered:
             yield buffered.rstrip("\r")

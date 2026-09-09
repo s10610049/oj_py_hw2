@@ -84,9 +84,9 @@ def response(body, status=200):
 async def services():
     instances = []
 
-    def create(config=None, handler=None):
+    def create(config=None, handler=None, **kwargs):
         transport = httpx.MockTransport(handler) if handler else None
-        service = AIService(config, transport=transport)
+        service = AIService(config, transport=transport, **kwargs)
         instances.append(service)
         return service
 
@@ -96,7 +96,7 @@ async def services():
 
 
 async def finished(service, task, user="alice"):
-    await asyncio.wait_for(service._tasks[task["task_id"]].future, timeout=2)
+    await asyncio.wait_for(service._tasks[task["task_id"]].future, timeout=15)
     return await service.get(task["task_id"], user)
 
 
@@ -264,8 +264,14 @@ async def test_progress_elapsed_and_true_cancel_close_http(services, config, pro
     assert progress["status"] == "running" and "30个正文字符" in progress["progress"]
     assert progress["usage"]["source"] == "estimated"
     earlier = progress["elapsed_seconds"]
-    await asyncio.sleep(0.01)
-    assert (await service.get(task["task_id"], "alice"))["elapsed_seconds"] > earlier
+    # Windows' event-loop clock can wake a 10ms timer early (15.6ms resolution).
+    # Keep the strict elapsed-time invariant without assuming one timer's duration.
+    for _ in range(10):
+        await asyncio.sleep(0.02)
+        later = (await service.get(task["task_id"], "alice"))["elapsed_seconds"]
+        if later > earlier:
+            break
+    assert later > earlier
     for operation in (service.get, service.cancel):
         with pytest.raises(APIError) as caught:
             await operation(task["task_id"], "bob")
@@ -426,6 +432,18 @@ async def test_response_byte_limit_before_unbounded_line(services, config, monke
 
 
 @pytest.mark.asyncio
+async def test_content_and_event_limits_independent_of_wire_limit(services, config, monkeypatch):
+    monkeypatch.setattr(ai_module, "MAX_CONTENT_BYTES", 50)
+    service = services(config, lambda _: response(delta("x" * 51, "stop")))
+    final = await finished(service, await service.start("alice", "求和"))
+    assert final["status"] == "failed" and "生成内容" in final["error"]
+    monkeypatch.setattr(ai_module, "MAX_EVENT_LINE_BYTES", 100)
+    service = services(config, lambda _: response(b"data: " + b"x" * 101))
+    final = await finished(service, await service.start("alice", "求和"))
+    assert final["status"] == "failed" and "流事件" in final["error"]
+
+
+@pytest.mark.asyncio
 async def test_reference_validation_and_prompt(services, config, problem):
     requests = []
 
@@ -514,3 +532,108 @@ async def test_reset_during_configure_cannot_restore_key(services, config, monke
         await configuring
     assert caught.value.status == 409
     assert not (await service.get_config("alice"))["api_key_configured"]
+
+
+@pytest.mark.asyncio
+async def test_real_consistency_gate_repairs_once_and_accumulates_usage(services, config, problem):
+    broken = copy.deepcopy(problem)
+    broken["testcases"][0]["output"] = "999"
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return response(stream_bytes(broken if len(requests) == 1 else problem))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+    assert final["status"] == "completed"
+    assert len(requests) == 2 and len(requests[1]["messages"]) == 4
+    assert "authoring_check:answer_mismatch:case=1" in requests[1]["messages"][-1]["content"]
+    assert final["result"]["quality"]["reference_checked"]
+    assert final["result"]["quality"]["checked_cases"] == 3
+    assert final["usage"]["input_tokens"] == 2000
+    assert final["usage"]["output_tokens"] == 1000
+    assert final["usage"]["total_tokens"] == 3000
+    assert final["usage"]["cost"] == pytest.approx(0.012)
+    assert not final["usage"]["incomplete"]
+
+
+@pytest.mark.asyncio
+async def test_failed_consistency_never_returns_problem_or_retries_forever(
+    services, config, problem
+):
+    problem["testcases"][0]["output"] = "999"
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return response(stream_bytes(problem))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+    assert len(calls) == 2
+    assert final["status"] == "failed" and final["result"] is None
+    assert "一致性" in final["error"]
+    assert final["usage"]["total_tokens"] == 3000
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_checker_and_total_deadline(services, config, problem, monkeypatch):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def blocking_check(value, progress):
+        progress("正在校验参考解与答案")
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(ai_module, "check_generated", blocking_check)
+    service = services(config, lambda _: response(stream_bytes(problem)))
+    task = await service.start("alice", "整数求和")
+    await asyncio.wait_for(entered.wait(), 1)
+    assert (await service.get(task["task_id"], "alice"))["progress"] == "正在校验参考解与答案"
+    assert (await service.cancel(task["task_id"], "alice"))["status"] == "cancelled"
+    assert cancelled.is_set()
+    monkeypatch.setattr(ai_module, "TASK_TIMEOUT_SECONDS", 0.05)
+    final = await finished(service, await service.start("alice", "整数求和"))
+    assert final["status"] == "failed" and "超时" in final["error"]
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_reset_overall_deadline(services, config, problem, monkeypatch):
+    calls = []
+
+    async def handler(request):
+        calls.append(request)
+        await asyncio.sleep(0.08)
+        return response(stream_bytes(problem))
+
+    async def reject(value, progress):
+        raise APIError(400, "authoring_check:answer_mismatch:case=1")
+
+    monkeypatch.setattr(ai_module, "check_generated", reject)
+    monkeypatch.setattr(ai_module, "TASK_TIMEOUT_SECONDS", 0.13)
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "整数求和"))
+    assert len(calls) == 2 and final["status"] == "failed" and "超时" in final["error"]
+    assert final["usage"]["incomplete"] and final["usage"]["cost"] is None
+
+
+@pytest.mark.asyncio
+async def test_opt_in_candidate_evidence_excludes_configuration(
+    services, config, problem, tmp_path
+):
+    problem["testcases"][0]["output"] = "999"
+    service = services(
+        config, lambda _: response(stream_bytes(problem)), evidence_directory=tmp_path
+    )
+    final = await finished(service, await service.start("alice", "整数求和"))
+    assert final["status"] == "failed"
+    artifacts = list(tmp_path.glob("*.json"))
+    assert len(artifacts) == 2
+    for path in artifacts:
+        text = path.read_text(encoding="utf-8")
+        assert config["api_key"] not in text and "alice" not in text
+        assert set(json.loads(text)) == {"candidate", "check"}

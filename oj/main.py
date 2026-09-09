@@ -141,7 +141,10 @@ def create_app(database_path=None, *, bcrypt_rounds=12, ai_config=None):
                 submission.update(status="error", error_info="评测被服务重启中断，请重新评测")
                 await store.put("submissions", submission["submission_id"], submission)
         application.state.ai = AIService(
-            default_config=load_ai_config() if ai_config is None else ai_config or None
+            default_config=load_ai_config() if ai_config is None else ai_config or None,
+            evidence_directory=(
+                "runtime/authoring-evidence" if os.environ.get("OJ_AI_EVIDENCE") == "1" else None
+            ),
         )
         yield
         await cancel_jobs()
