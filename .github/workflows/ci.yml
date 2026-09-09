@@ -1,0 +1,37 @@
+name: Course acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: '0.11.14'
+          python-version: ${{ matrix.python }}
+      - name: Reproduce locked environment
+        run: uv sync --locked
+      - name: Compiler availability
+        run: g++ --version
+      - name: Unit, contract and real process tests
+        run: uv run --locked python -m pytest -ra
+      - name: Style and dependency consistency
+        run: |
+          uv run --locked python -m flake8 .
+          uv run --locked python -m black --check .
+          uv pip check
