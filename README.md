@@ -136,32 +136,6 @@ uv run --locked python scripts/seed_demo.py --username your_username
 uv run --locked python scripts/seed_demo.py --course-admin
 ```
 
-### 创建本地个人演示账户
-
-```sh
-uv run --locked python scripts/create_local_account.py --username your_name
-```
-
-随机密码只写入被忽略的 `.env.local`，不会打印。若 `.env.local` 已存在，脚本会拒绝覆盖。
-
-### 重建判题与 AI 演示痕迹
-
-先在当前终端安全设置 `OJ_LOCAL_USERNAME` 与 `OJ_LOCAL_PASSWORD`，再运行：
-
-```sh
-uv run --locked python scripts/seed_demo_activity.py --wait-for-quota
-```
-
-脚本会先对 SQLite 做完整性检查过的热备份，再幂等创建 AC、部分分、WA、CE、TLE 记录和“首稿＋整改稿”AI 会话。未配置真实模型时可加 `--skip-ai`，只重建判题记录。
-
-管理员全员面板需要多账户演示时，使用：
-
-```sh
-uv run --locked python scripts/seed_demo_cohort.py --wait-for-quota
-```
-
-该脚本创建或复用 `demo_aurora`、`demo_binary`、`demo_cedar` 三个本地账户，并为每个账户建立差异化判题结果与 AI 修订轨迹。所有账户共用的演示密码只从无回显提示或 `OJ_LOCAL_PASSWORD` 读取，不进入仓库。未配置模型时可加 `--skip-ai`。
-
 ### 私人洛谷学习缓存
 
 `scripts/cache_luogu.py` 只缓存少量公开题目 HTML 到被忽略的 `runtime/catalog/`，不登录、不携带 Cookie，也不获取官方隐藏测试点：
@@ -222,7 +196,7 @@ uv run --locked python -m black --check .
 uv run --locked pytest tests/test_api.py tests/test_judge.py -q
 uv run --locked pytest tests/test_authoring_sessions.py tests/test_authoring_ui.py -q
 uv run --locked pytest tests/test_admin_analytics.py tests/test_analytics.py -q
-uv run --locked pytest tests/test_seed_data.py tests/test_seed_demo_activity.py -q
+uv run --locked pytest tests/test_seed_data.py -q
 ```
 
 测试覆盖接口与权限、SQLite 生命周期、Python/C++ 判题、进程清理、导入安全、AI 流式接收/取消/计价/一致性、命题修订、编程助手、前端 AppTest 和仓库卫生。自动化通过不等于真实模型质量、Linux 资源限制或浏览器视觉已经验收；发布前仍需分别保留这些证据。
@@ -234,6 +208,8 @@ uv run --locked python scripts/smoke_ai.py --live
 ```
 
 该命令只创建一个命题任务；任务在一致性修复路径上最多可能发起三次计费模型请求，并把结果写入被忽略的 `runtime/`。不要在 CI 或无明确费用预期时运行。
+
+需要执行完整的 19 用例真实模型验收矩阵时，可显式运行 `uv run --locked python scripts/verify_ai_matrix.py --live`。该命令会产生多次计费请求，证据只写入被忽略的 `runtime/`；不要在 CI 或未确认费用时运行。
 
 ## 目录结构
 
@@ -268,10 +244,9 @@ uv run --locked python scripts/smoke_ai.py --live
 ├─ scripts/
 │  ├─ seed_data.py                # 24 道原创题与参考解
 │  ├─ seed_demo.py                # 通过 REST 导入原创题
-│  ├─ seed_demo_activity.py       # 单账户判题/AI 演示痕迹
-│  ├─ seed_demo_cohort.py         # 多账户管理面板演示数据
 │  ├─ cache_luogu.py              # 私人公开题面缓存
-│  └─ smoke_ai.py                 # 显式启用的真实模型诊断
+│  ├─ smoke_ai.py                 # 显式启用的单任务真实模型诊断
+│  └─ verify_ai_matrix.py         # 显式启用的 19 用例真实模型验收
 ├─ static/                        # Logo、AI 头像、本地字体与许可证
 ├─ tests/                         # 单元、合同、集成与前端测试
 ├─ 实验报告.pdf                   # 最终实验报告（纳入 Git）
@@ -308,10 +283,6 @@ uv run --locked python scripts/smoke_ai.py --live
 ### 旧 AI 任务如何恢复
 
 智能命题页的“恢复已有任务”接受命题会话编号；升级前创建的兼容任务会显示真实进度和草稿，并可迁移到新的持久化修订流程。恢复失败时先确认当前登录用户是任务创建者或管理员，再核对后端是否仍使用原数据库。
-
-### 演示脚本提示配额或已有数据
-
-种子脚本是幂等的：`existing` 表示对应痕迹已存在。提交配额不足时等待窗口恢复后加 `--wait-for-quota`；未配置 AI 时使用 `--skip-ai`。脚本执行前会备份 SQLite，切勿绕过备份去手工改数据库。
 
 ## 不使用 uv
 
