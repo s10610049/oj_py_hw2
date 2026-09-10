@@ -33,7 +33,8 @@ MAX_CONTENT_BYTES = 2_000_000
 MAX_EVENT_LINE_BYTES = 256_000
 MAX_PROMPT_BYTES = 200_000
 MAX_OUTPUT_TOKENS = 8000
-MAX_PROVIDER_CALLS = 3
+MAX_PROVIDER_CALLS = 5
+MIN_RECOVERY_CALLS = 3
 TERMINAL = {"completed", "cancelled", "failed"}
 PRICE_NOTE = "费用按配置单价估算，缓存命中/峰谷价格可能不同，不等于官方账单。"
 DEFAULT_VALIDATION_NOTES = (
@@ -918,7 +919,7 @@ class AIService:
                 code = safe.group(0)
                 evidence_candidate = candidate if candidate is not None else task.output
                 await self._record_candidate_evidence(task, attempt, evidence_candidate, code)
-                if attempt == MAX_PROVIDER_CALLS - 1:
+                if attempt >= MIN_RECOVERY_CALLS - 1:
                     recovery_candidate = candidate
                     fallback = self._deterministic_generator_fallback(candidate, code)
                     if fallback is not None:
@@ -968,19 +969,20 @@ class AIService:
                             fallback_code = _SAFE_CHECK.fullmatch(fallback_error.message)
                             if fallback_code:
                                 code = fallback_code.group(0)
-                    raise _TaskFailure(
-                        "生成的题目连续未通过一致性校验；这是生成结果问题，可直接重试，"
-                        "无需修改有效的命题要求",
-                        error_code="authoring_validation_exhausted",
-                        retryable=True,
-                        detail=code,
-                    ) from None
+                    if attempt == MAX_PROVIDER_CALLS - 1:
+                        raise _TaskFailure(
+                            "生成的题目连续未通过一致性校验；这是生成结果问题，可直接重试，"
+                            "无需修改有效的命题要求",
+                            error_code="authoring_validation_exhausted",
+                            retryable=True,
+                            detail=code,
+                        ) from None
                 task.progress = (
                     f"校验发现{code.removeprefix('authoring_check:')}问题，"
                     f"正在进行第{attempt + 1}次自动修正"
                 )
                 task.progress_percent = max(task.progress_percent, 62)
-                if attempt == MAX_PROVIDER_CALLS - 2:
+                if attempt % 2 == 1:
                     self._prepare_fresh_retry(task, code)
                 else:
                     self._prepare_retry(task, self._repair_feedback(code))

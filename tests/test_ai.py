@@ -681,17 +681,19 @@ async def test_repeated_reference_runtime_failure_uses_fresh_final_design(
 
     def handler(request):
         requests.append(json.loads(request.content))
-        candidate = broken if len(requests) < 3 else problem
+        candidate = broken if len(requests) < 5 else problem
         return response(stream_bytes(candidate))
 
     service = services(config, handler)
     final = await finished(service, await service.start("alice", "生成可靠题目"))
 
     assert final["status"] == "completed"
-    assert final["provider_calls"] == 3
+    assert final["provider_calls"] == 5
     assert len(requests[1]["messages"]) == 4
     assert len(requests[2]["messages"]) == 3
-    fresh_messages = json.dumps(requests[2]["messages"], ensure_ascii=False)
+    assert len(requests[3]["messages"]) == 5
+    assert len(requests[4]["messages"]) == 3
+    fresh_messages = json.dumps(requests[4]["messages"], ensure_ascii=False)
     assert "不要复用前稿" in fresh_messages
     assert "broken candidate" not in fresh_messages
 
@@ -964,7 +966,7 @@ async def test_persistently_missing_generator_contract_fails_structurally(
     service = services(config, handler)
     final = await finished(service, await service.start("alice", "整数求和"))
 
-    assert len(calls) == 3
+    assert len(calls) == 5
     assert final["status"] == "failed" and final["result"] is None
     assert final["error_code"] == "authoring_validation_exhausted"
     assert final["error_detail"] == "authoring_check:problem_schema"
