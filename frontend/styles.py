@@ -16,11 +16,10 @@ CSS = """
   --oj-surface-tint:#F7FBF8;--oj-focus-ring:rgba(26,107,74,.13);
   --oj-success:#187A55;--oj-danger:#C13D3D;--oj-warning:#A76500;--oj-info:#3468A5;
   --oj-ease:cubic-bezier(.2,0,0,1);}
-/* Streamlit 1.63's supported minimal toolbar mode is the primary control.
-   These exact framework selectors prevent a transient Deploy/menu flash while
-   deliberately preserving the header and the sidebar collapse control. */
-header [data-testid="stToolbar"],header [data-testid="stAppDeployButton"],#MainMenu {
-  display:none;}
+/* Keep Streamlit's toolbar host mounted: in the collapsed state it owns the
+   only native button that can reopen the sidebar. Hide only deploy/menu UI. */
+header [data-testid="stToolbar"] {display:flex;align-items:center;}
+header [data-testid="stAppDeployButton"],#MainMenu {display:none;}
 .st-key-auth_language_bar {min-height:40px;margin-bottom:2px;}
 .st-key-workspace_commandbar {position:relative;z-index:20;padding-bottom:12px;
   margin-bottom:10px;border-bottom:1px solid var(--oj-border-accent);}

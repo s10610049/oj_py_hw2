@@ -35,6 +35,7 @@ from frontend.client import APIClient, APIError, resource
 from frontend.common import api, clear_session, go, notice
 from frontend.forms import TRANSLATION_FIELDS, optional_number, problem_payload
 from frontend.styles import loading
+from frontend.web_research import WebResearchError, research_prompt, search_related_problems
 
 _COPY = {
     "zh-CN": {
@@ -65,6 +66,12 @@ _COPY = {
         "free_prompt_placeholder": "可自由补充题面风格、情境、限制或其他希望模型遵守的细节。",
         "reference": "参考题号（可选）",
         "reference_help": "可引用题库中的现有题目作为风格或结构参考。",
+        "web_research": "联网参考相关题目",
+        "web_research_help": "生成前实时检索公开题目索引，只参考主题与测试覆盖，不复制原题。",
+        "web_searching": "🌐 正在检索相关题目…",
+        "web_ready": "已找到 {count} 条互联网参考，正在交给模型独立命题。",
+        "web_failed": "联网检索暂时不可用，请取消勾选后生成，或稍后重试。",
+        "web_active": "正在参考互联网题目索引",
         "files": "参考文件（可选）",
         "files_help": "支持文本、源码、PDF、Office 文档、图片与安全 ZIP；单个 10 MiB，最多 8 个。",
         "prepare_files": "解析所选附件",
@@ -232,6 +239,12 @@ _COPY = {
         ),
         "reference": "Reference problem ID (optional)",
         "reference_help": "Use an existing catalog problem as a style or structure reference.",
+        "web_research": "Research related problems online",
+        "web_research_help": "Searches public problem indexes before generation; the model may use themes and coverage but must not copy a problem.",
+        "web_searching": "🌐 Searching for related problems…",
+        "web_ready": "Found {count} web references; the model will now design an original problem.",
+        "web_failed": "Web research is temporarily unavailable. Clear the option or try again later.",
+        "web_active": "Using live web problem references",
         "files": "Reference files (optional)",
         "files_help": (
             "Text, source, PDF, Office, images, and safe ZIP are supported; "
@@ -475,6 +488,9 @@ def _authoring_styles():
   animation:oj-authoring-review 240ms var(--oj-ease);}
 .st-key-ai_authoring_status{padding:16px 18px;border:1px solid #D7E5DD;
   border-radius:14px;background:var(--oj-surface-tint);}
+.oj-web-research-badge{display:inline-flex;align-items:center;gap:7px;margin:2px 0 8px;
+  padding:6px 10px;border:1px solid #C8DED2;border-radius:999px;background:#F2F8F5;
+  color:#176847;font-size:12px;font-weight:600;}
 @keyframes oj-authoring-unlock{from{opacity:.72;transform:translateY(4px)}
   to{opacity:1;transform:translateY(0)}}
 @keyframes oj-authoring-review{from{opacity:.72;transform:translateY(6px)}
@@ -612,6 +628,13 @@ def usage_display(usage, prompt_text="", config=None, locale=None, *, heading=No
 
 
 def _loading(progress, elapsed, locale):
+    if st.session_state.get("_ai_web_research_active"):
+        st.html(
+            '<div class="oj-web-research-badge" role="status" aria-live="polite">'
+            "<span aria-hidden=\"true\">🌐</span>"
+            + html.escape(_copy(locale)["web_active"])
+            + "</div>"
+        )
     if locale_code(locale) == "zh-CN":
         loading(progress, elapsed)
         return
@@ -2012,6 +2035,12 @@ def _render_session_authoring(locale, client, config):
                 help=copy["reference_help"],
                 disabled=locked,
             )
+            web_research = st.checkbox(
+                copy["web_research"],
+                key="ai_web_research",
+                help=copy["web_research_help"],
+                disabled=locked,
+            )
             files = st.file_uploader(
                 copy["files"],
                 type=_UPLOAD_TYPES,
@@ -2055,22 +2084,40 @@ def _render_session_authoring(locale, client, config):
         elif not attachments_ready:
             st.error(copy["attachment_confirm_required"])
         else:
-            try:
-                request = build_authoring_request(
-                    requirement=requirement,
-                    difficulty_id=difficulty,
-                    knowledge_points=selected_points,
-                    free_prompt=free_prompt,
-                    reference_problem_id=reference,
-                    attachments=attachment_references,
-                )
-            except ValueError as error:
-                st.error(
-                    copy["empty_requirement"]
-                    if str(error) == "empty requirement"
-                    else copy["invalid_request"]
-                )
-            else:
+            web_context = ""
+            web_search_ok = True
+            if web_research:
+                try:
+                    with st.spinner(copy["web_searching"]):
+                        web_results = search_related_problems(requirement)
+                except WebResearchError:
+                    st.error(copy["web_failed"])
+                    web_search_ok = False
+                else:
+                    web_context = research_prompt(web_results)
+                    st.caption(copy["web_ready"].format(count=len(web_results)))
+            st.session_state["_ai_web_research_active"] = bool(web_research and web_search_ok)
+            enriched_prompt = "\n\n".join(
+                part for part in (str(free_prompt or "").strip(), web_context) if part
+            )
+            request = None
+            if web_search_ok:
+                try:
+                    request = build_authoring_request(
+                        requirement=requirement,
+                        difficulty_id=difficulty,
+                        knowledge_points=selected_points,
+                        free_prompt=enriched_prompt,
+                        reference_problem_id=reference,
+                        attachments=attachment_references,
+                    )
+                except ValueError as error:
+                    st.error(
+                        copy["empty_requirement"]
+                        if str(error) == "empty requirement"
+                        else copy["invalid_request"]
+                    )
+            if request is not None:
                 if session is None:
                     operation = "initial"
                     path = "/api/ai/authoring-sessions/"
@@ -2112,6 +2159,8 @@ def _render_session_authoring(locale, client, config):
             st.session_state.pop("_ai_authoring_session", None)
             st.session_state["_ai_task"] = None
             st.session_state.pop("_ai_editing_requirements", None)
+            st.session_state.pop("_ai_web_research_active", None)
+            st.session_state.pop("ai_web_research", None)
             _rotate_initial_attempt()
             _queue_form_seed(None)
             st.rerun()

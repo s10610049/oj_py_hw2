@@ -697,6 +697,52 @@ async def test_repeated_reference_runtime_failure_uses_fresh_final_design(
 
 
 @pytest.mark.asyncio
+async def test_repeated_problem_schema_failure_uses_fresh_final_design(
+    services, config, problem
+):
+    broken = {"title": "schema-broken-marker"}
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        candidate = broken if len(requests) < 3 else problem
+        return response(stream_bytes(candidate))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "生成可靠题目"))
+
+    assert final["status"] == "completed"
+    assert final["provider_calls"] == 3
+    assert len(requests[1]["messages"]) == 4
+    assert len(requests[2]["messages"]) == 3
+    fresh_messages = json.dumps(requests[2]["messages"], ensure_ascii=False)
+    assert "authoring_check:problem_schema" in fresh_messages
+    assert "不要复用前稿" in fresh_messages
+    assert "schema-broken-marker" not in fresh_messages
+
+
+@pytest.mark.asyncio
+async def test_repeated_unsafe_reference_uses_fresh_final_design(services, config, problem):
+    broken = copy.deepcopy(problem)
+    broken["reference_solution"] = "print(open('/unsafe-reference-marker'))"
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return response(stream_bytes(broken if len(requests) < 3 else problem))
+
+    service = services(config, handler)
+    final = await finished(service, await service.start("alice", "生成滑动窗口题目"))
+
+    assert final["status"] == "completed" and final["provider_calls"] == 3
+    fresh_messages = json.dumps(requests[2]["messages"], ensure_ascii=False)
+    assert len(requests[2]["messages"]) == 3
+    assert "authoring_check:reference_unsafe_source" in fresh_messages
+    assert "只使用系统允许的语法和标准库" in fresh_messages
+    assert "unsafe-reference-marker" not in fresh_messages
+
+
+@pytest.mark.asyncio
 async def test_network_exception_is_sanitized(services, config):
     def handler(request):
         raise httpx.ConnectError(config["api_key"] + " request headers", request=request)

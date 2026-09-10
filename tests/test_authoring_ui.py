@@ -9,6 +9,7 @@ import httpx
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import frontend.ai_page as ai_page_module
 from frontend.authoring_ui import (
     build_authoring_request,
     difficulty_options,
@@ -652,6 +653,34 @@ def test_reference_file_upload_sends_only_locked_identity_and_reuses_cache():
     assert not at.exception and len(client.uploads) == 1
     resent = next(call[2] for call in client.calls if call[1].endswith("/requirements"))
     assert resent["request"]["attachments"] == created["request"]["attachments"]
+
+
+def test_web_research_checkbox_injects_live_reference_context(monkeypatch):
+    monkeypatch.setattr(
+        ai_page_module,
+        "search_related_problems",
+        lambda requirement: [
+            {
+                "title": "数列前缀和 2",
+                "url": "https://www.luogu.com.cn/problem/B3645",
+                "snippet": "洛谷题号 B3645；难度等级 3",
+            }
+        ],
+    )
+    client = SessionClient()
+    at = app(client)
+    at.text_area(key="ai_requirement").set_value("设计一道前缀和区间查询题")
+    next(item for item in at.checkbox if item.key == "ai_web_research").check().run()
+    button(at, "生成题目").click().run()
+
+    assert not at.exception
+    created = next(
+        call[2] for call in client.calls if call[:2] == ("POST", "/api/ai/authoring-sessions/")
+    )
+    context = created["request"]["free_prompt"]
+    assert "untrusted_web_problem_references" in context
+    assert "https://www.luogu.com.cn/problem/B3645" in context
+    assert at.session_state["_ai_web_research_active"] is True
 
 
 def test_manual_editor_attachment_handoff_is_revalidated_and_sent_to_ai():

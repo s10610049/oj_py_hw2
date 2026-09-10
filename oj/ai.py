@@ -857,7 +857,7 @@ class AIService:
 
     @classmethod
     def _prepare_fresh_retry(cls, task, code):
-        """Use the final provider call for a fresh design after repeated semantic failure."""
+        """Use the final provider call for a clean design after two failed drafts."""
 
         task.messages = copy.deepcopy(task.messages[:2])
         task.messages.append(
@@ -867,6 +867,7 @@ class AIService:
                     f"前两稿均未通过后台校验（{code}）。不要复用前稿题面、测例、"
                     "参考解或生成器；请从原始用户要求重新设计另一道完整题目。"
                     "先在内部逐项手算所有小测例，再输出精简、严格、完整的JSON对象。"
+                    + cls._repair_feedback(code)
                 ),
             }
         )
@@ -979,16 +980,7 @@ class AIService:
                     f"正在进行第{attempt + 1}次自动修正"
                 )
                 task.progress_percent = max(task.progress_percent, 62)
-                category = code.removeprefix("authoring_check:").split(":", 1)[0]
-                semantic = category in {
-                    "answer_mismatch",
-                    "generated_problem_schema",
-                    "reference_execution",
-                    "reference_memory",
-                    "reference_output",
-                    "reference_timeout",
-                }
-                if attempt == MAX_PROVIDER_CALLS - 2 and semantic:
+                if attempt == MAX_PROVIDER_CALLS - 2:
                     self._prepare_fresh_retry(task, code)
                 else:
                     self._prepare_retry(task, self._repair_feedback(code))
