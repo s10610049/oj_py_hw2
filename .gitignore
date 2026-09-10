@@ -7,6 +7,8 @@
 /HANDOFF.md
 /DEMO_GUIDE.md
 /PROJECT_WALKTHROUGH.md
+/report/
+/output/
 
 # Credentials (only the empty example is versioned)
 .env

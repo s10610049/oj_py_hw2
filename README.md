@@ -274,18 +274,14 @@ uv run --locked python scripts/smoke_ai.py --live
 │  └─ smoke_ai.py                 # 显式启用的真实模型诊断
 ├─ static/                        # Logo、AI 头像、本地字体与许可证
 ├─ tests/                         # 单元、合同、集成与前端测试
-├─ report/
-│  ├─ REPORT_SOURCE.md            # 实验报告的可审阅事实源
-│  ├─ generate_report.py          # PDF 生成与结构校验
-│  └─ assets/                     # 经浏览器验收的报告截图
-├─ output/pdf/实验报告.pdf        # 最终实验报告（纳入 Git）
+├─ 实验报告.pdf                   # 最终实验报告（纳入 Git）
 ├─ .github/workflows/ci.yml       # Python 3.10/3.12 持续集成
 ├─ .env.example                   # 无密钥配置示例
 ├─ pyproject.toml                 # 依赖和工具配置
 └─ uv.lock                        # 锁定依赖
 ```
 
-`runtime/` 在首次启动时创建并被 Git 忽略；现场 Demo 指南、项目通俗讲解以及其他本地研发资料和协作记忆也由忽略规则排除，不是运行依赖。最终实验报告位于 `output/pdf/`，保留在 `docs/` 之外并纳入版本库。
+`runtime/` 在首次启动时创建并被 Git 忽略；现场 Demo 指南、项目通俗讲解、报告生成过程文件以及其他本地研发资料和协作记忆也由忽略规则排除，不是运行依赖。最终实验报告以根目录 `实验报告.pdf` 纳入版本库。
 
 ## 故障排查
 
@@ -365,4 +361,4 @@ uv run --locked pytest
 提交采用英文 Conventional Commits，例如 `feat(authoring): ...`、`fix(judge): ...`。提交前检查完整测试、实际差异和暂存文件，确保本地资料与凭据未进入版本库。
 
 - [课程 OJ 实验文档](https://dbg-course.github.io/python-docs/oj/)
-- [实验报告](output/pdf/实验报告.pdf)
+- [实验报告](实验报告.pdf)
