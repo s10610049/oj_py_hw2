@@ -162,9 +162,6 @@ uv run --locked python scripts/seed_demo_cohort.py --wait-for-quota
 
 该脚本创建或复用 `demo_aurora`、`demo_binary`、`demo_cedar` 三个本地账户，并为每个账户建立差异化判题结果与 AI 修订轨迹。所有账户共用的演示密码只从无回显提示或 `OJ_LOCAL_PASSWORD` 读取，不进入仓库。未配置模型时可加 `--skip-ai`。
 
-完整现场演示步骤、代码和命题提示词见 [DEMO_GUIDE.md](DEMO_GUIDE.md)。
-希望先理解系统怎样工作，可阅读 [PROJECT_WALKTHROUGH.md](PROJECT_WALKTHROUGH.md)。
-
 ### 私人洛谷学习缓存
 
 `scripts/cache_luogu.py` 只缓存少量公开题目 HTML 到被忽略的 `runtime/catalog/`，不登录、不携带 Cookie，也不获取官方隐藏测试点：
@@ -281,16 +278,14 @@ uv run --locked python scripts/smoke_ai.py --live
 │  ├─ REPORT_SOURCE.md            # 实验报告的可审阅事实源
 │  ├─ generate_report.py          # PDF 生成与结构校验
 │  └─ assets/                     # 经浏览器验收的报告截图
-├─ output/pdf/实验报告.pdf        # 最终实验报告
+├─ output/pdf/实验报告.pdf        # 最终实验报告（纳入 Git）
 ├─ .github/workflows/ci.yml       # Python 3.10/3.12 持续集成
 ├─ .env.example                   # 无密钥配置示例
 ├─ pyproject.toml                 # 依赖和工具配置
-├─ uv.lock                        # 锁定依赖
-├─ DEMO_GUIDE.md                  # 全部功能现场演示脚本、代码与 Prompt
-└─ PROJECT_WALKTHROUGH.md         # 面向非专业读者的架构与实现导览
+└─ uv.lock                        # 锁定依赖
 ```
 
-`runtime/` 在首次启动时创建并被 Git 忽略；其他本地研发资料和协作记忆也由忽略规则排除，不是运行依赖。
+`runtime/` 在首次启动时创建并被 Git 忽略；现场 Demo 指南、项目通俗讲解以及其他本地研发资料和协作记忆也由忽略规则排除，不是运行依赖。最终实验报告位于 `output/pdf/`，保留在 `docs/` 之外并纳入版本库。
 
 ## 故障排查
 
@@ -370,6 +365,4 @@ uv run --locked pytest
 提交采用英文 Conventional Commits，例如 `feat(authoring): ...`、`fix(judge): ...`。提交前检查完整测试、实际差异和暂存文件，确保本地资料与凭据未进入版本库。
 
 - [课程 OJ 实验文档](https://dbg-course.github.io/python-docs/oj/)
-- [现场演示指南](DEMO_GUIDE.md)
-- [项目实现导览](PROJECT_WALKTHROUGH.md)
 - [实验报告](output/pdf/实验报告.pdf)

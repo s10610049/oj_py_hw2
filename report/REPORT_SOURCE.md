@@ -504,4 +504,4 @@ text: 项目把课程 Step 1-6 和 Advance 连成了可演示、可追溯的主�
 
 - 课程 OJ 实验说明、Step 1-6、API、FAQ、评分标准与 Advance：`https://dbg-course.github.io/python-docs/oj/`
 - FastAPI、Streamlit、SQLite、Python `asyncio` 与 Linux `resource` 官方文档
-- 项目 `README.md`、`DEMO_GUIDE.md` 与 `PROJECT_WALKTHROUGH.md`
+- 项目 `README.md`、核心源码、自动化测试与可复现图表素材
